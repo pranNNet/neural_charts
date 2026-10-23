@@ -7,6 +7,8 @@ Generates the raw FV data for ladder step 1 (Sod pressure-ratio sweep), plan sec
   the step times, and store_idx (the steps on the 0.002 grid)
 - Writes one raw HDF5 file (output.path in the config) and a short run report next to it
 
+This is the raw dataset: solver output only. Anything derived from it (labels, fronts, downsampling,
+the exact reference) belongs to the separate package in /mnt/project-files/preprocessing/.
 
 Usage:
     python data_generation.py                                   # full raw dataset, all cores
@@ -116,7 +118,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=R.DEFAULT_CONFIG, help='generation config (YAML)')
     ap.add_argument('--out', default=None, help='overrides output.path in the config')
-    ap.add_argument('--workers', type=int, default=os.cpu_count())
     ap.add_argument('--limit', type=int, default=None, help='only the first N cases of each split (smoke test)')
     args = ap.parse_args()
 
@@ -129,7 +130,7 @@ def main():
 
     reports = []
     t0 = time.time()
-    with h5py.File(out_path, 'w') as h5, Pool(args.workers) as pool:
+    with h5py.File(out_path, 'w') as h5, Pool(cfg.workers or os.cpu_count()) as pool:
         write_header(h5, cfg, cases)
         for i, (case, data, rep) in enumerate(pool.imap_unordered(generate_case, [(cfg, c) for c in cases])):
             write_case(h5, cfg, case, data)

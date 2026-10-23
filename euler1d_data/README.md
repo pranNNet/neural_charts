@@ -1,3 +1,10 @@
+# Ladder step 1 raw dataset
+
+This folder holds your 1D Euler solver (`euler1d/`, `infrastructure/`) and the scripts that run it to produce the **raw dataset** for ladder step 1. Raw means it contains only what the solver computed: no labels, no fronts and no downsampling. `CHANGES.md` lists what was changed in your code and why.
+
+The training file (labels, fronts, exact reference) is built from this raw file by the separate preprocessing package in `/mnt/project-files/preprocessing/`, which has its own README.
+
+---
 
 ## 1. What the dataset is
 
@@ -37,7 +44,8 @@ Every setting lives in **`generation_config.yaml`**:
 - the grid and times;
 - the scheme;
 - the values of r for each split;
-- the output path.
+- the output path;
+- the number of worker processes (`execution.workers`; `null` uses all cores).
 
 Each setting is commented in the file. Change the YAML, not the code. Every script takes `--config` to use another file. The raw file stores a copy of the YAML it was made with, in the attribute `config_yaml`, so you can always see exactly how a file was produced.
 

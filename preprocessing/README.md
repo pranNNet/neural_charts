@@ -19,7 +19,7 @@ python -m preprocessing.build_dataset --raw <raw.h5> --out <train.h5>   # other 
 python -m preprocessing.build_dataset --config <other.yaml>             # other settings
 ```
 
-The settings live in `preprocessing_config.yaml`: the input and output paths (relative to the YAML file), `T_train`, and the thresholds for the jump flags. A copy of the YAML is saved inside the output file. The full set of 104 cases should take under a minute on 4 cores (each case takes about 1 s).
+The settings live in `preprocessing_config.yaml`: the input and output paths (relative to the YAML file), the number of worker processes (`workers`, null = all cores), `T_train`, and the thresholds for the jump flags. A copy of the YAML is saved inside the output file. The full set of 104 cases should take under a minute on 4 cores (each case takes about 1 s).
 
 | File | What it does |
 |---|---|

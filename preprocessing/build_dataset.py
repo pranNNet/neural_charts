@@ -22,7 +22,6 @@ from euler1d_data.infrastructure.solver_config import cons_to_prim
 from preprocessing.jump_flags import jump_flags
 from preprocessing.exact import exact_cell_averages
 
-# DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'preprocessing_config.yaml')
 DEFAULT_CONFIG = Path(__file__).parent / 'configs' / 'preprocessing_config.yaml'
 
 
@@ -61,7 +60,6 @@ def main():
     ap.add_argument('--config', default=DEFAULT_CONFIG)
     ap.add_argument('--raw', help='overrides paths.raw in the config')
     ap.add_argument('--out', help='overrides paths.out in the config')
-    ap.add_argument('--workers', type=int, default=os.cpu_count())
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -82,7 +80,7 @@ def main():
         cids = sorted(raw['cases'].keys())
 
         print('case  split     r       flags per snapshot  max flag-to-exact (dx)')
-        with Pool(args.workers) as pool:
+        with Pool(cfg['workers'] or os.cpu_count()) as pool:
             for cid, attrs, W, flags, U_exact, (n_lo, n_hi, err) in pool.imap(partial(process_case, raw_path, cfg), cids):
                 g = out.create_group(f'cases/{cid}')
                 g.attrs.update(attrs)

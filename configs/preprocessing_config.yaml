@@ -7,6 +7,8 @@ paths:                    # relative to this file; --raw and --out override them
 
 T_train: 0.16             # training horizon: train on t <= T_train; (T_train, t_max] is held out
 
+workers: 8                # worker processes, one case each at a time; null = all cores
+
 jump_flags:               # face tests on normalized jumps (jump_flags.py); thresholds are guesses to tune
   t_min: 0.02             # snapshots before this are flagged -1 (ignored): the waves are too close together
   tau_s: 0.02             # shock: pressure jump g_p > tau_s ...

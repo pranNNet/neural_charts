@@ -11,7 +11,7 @@ Arrays here are (T, N, 3) with the last axis (rho, rho*v, E).
 '''
 
 import io
-# import os
+import os
 from pathlib import Path
 import contextlib
 from dataclasses import dataclass
@@ -50,6 +50,7 @@ class GenerationConfig:
     cases: list                  # [{'split', 'n', 'r_min', 'r_max', 'seed'}]
     output_path: str
     gzip_level: int
+    workers: object              # int, or None for all cores
 
     @property
     def n_x(self):
@@ -78,7 +79,7 @@ def load_config(path=DEFAULT_CONFIG):
     with open(path) as f:
         text = f.read()
     c = yaml.safe_load(text)
-    p, g, t, s, o = c['physics'], c['grid'], c['time'], c['scheme'], c['output']
+    p, g, t, s, o, e = c['physics'], c['grid'], c['time'], c['scheme'], c['output'], c['execution']
     cfg = GenerationConfig(
         raw=c, text=text,
         gamma=float(p['gamma']), length=float(p['length']), x0=float(p['x0']),
@@ -88,7 +89,8 @@ def load_config(path=DEFAULT_CONFIG):
         t_max=float(t['t_max']), dt_snapshot=float(t['dt_snapshot']),
         flux=s['flux'], reconstruction=s['reconstruction'], cfl=float(s['cfl']),
         bc=s['bc'], n_ghost=int(s['n_ghost']),
-        cases=list(c['cases']), output_path=o['path'], gzip_level=int(o['gzip_level']))
+        cases=list(c['cases']), output_path=o['path'], gzip_level=int(o['gzip_level']),
+        workers=None if e['workers'] is None else int(e['workers']))
     if cfg.n_fine % cfg.coarsen:
         raise ValueError('grid.n_fine must be a multiple of grid.coarsen')
     if abs((cfg.n_snapshots - 1) * cfg.dt_snapshot - cfg.t_max) > 1e-12:

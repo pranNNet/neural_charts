@@ -40,3 +40,6 @@ cases:
 output:
   path: ./euler1d_data/data/step1_sod_pr_raw.h5   # relative to where data_generation.py is run
   gzip_level: 4
+
+execution:
+  workers: 8            # worker processes, one case each at a time; null = all cores
