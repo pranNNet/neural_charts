@@ -1,0 +1,42 @@
+# Raw dataset for ladder step 1: Sod shock tubes that differ only in the pressure ratio r.
+# Read by run.py / data_generation.py / Sod_Shock_Tube_Validation.py (all take --config).
+# A copy of this file is stored in the raw HDF5 file (attribute config_yaml).
+
+physics:
+  gamma: 1.4
+  length: 1.0              # tube is x in [0, length]
+  x0: 0.4                  # diaphragm position
+  left:                    # left state; its pressure is r * right.p
+    rho: 1.0
+    v: 0.0
+  right:
+    rho: 0.125
+    v: 0.0
+    p: 0.1
+
+grid:
+  n_fine: 4096             # cells the solver runs on
+  coarsen: 8               # fine cells averaged into one saved cell (4096 / 8 = 512)
+
+time:
+  t_max: 0.24
+  dt_snapshot: 0.002       # every case's dt divides this exactly, so t = 0, 0.002, ... are solver steps
+
+scheme:
+  flux: HLLC               # HLLC or AUSM+
+  reconstruction: WENO5Z   # WENO5Z or WENO5
+  cfl: 0.5                 # target CFL; RK4 is not SSP, so stay well below 1
+  bc: Zero-Gradient
+  n_ghost: 3
+
+# Values of r: n values per split, stratified log-uniform on [r_min, r_max] with the given seed.
+# log r_i = log r_min + (i + u_i)/n * log(r_max/r_min), u_i ~ U(0, 1).
+cases:
+  - {split: train,    n: 64, r_min: 2.0,  r_max: 10.0, seed: 0}
+  - {split: val,      n: 8,  r_min: 2.0,  r_max: 10.0, seed: 1}
+  - {split: test_id,  n: 16, r_min: 2.0,  r_max: 10.0, seed: 2}
+  - {split: test_ood, n: 16, r_min: 10.0, r_max: 16.0, seed: 3}
+
+output:
+  path: ./euler1d_data/data/step1_sod_pr_raw.h5   # relative to where data_generation.py is run
+  gzip_level: 4

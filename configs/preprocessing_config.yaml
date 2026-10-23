@@ -1,0 +1,15 @@
+# Training preprocessing settings, read by build_dataset.py (python -m preprocessing.build_dataset).
+# A copy is stored in the training file (attribute preprocessing_config).
+
+paths:                    # relative to this file; --raw and --out override them
+  raw: ../euler1d_data/data/step1_sod_pr_raw.h5
+  out: ./data/step1_sod_pr.h5
+
+T_train: 0.16             # training horizon: train on t <= T_train; (T_train, t_max] is held out
+
+jump_flags:               # face tests on normalized jumps (jump_flags.py); thresholds are guesses to tune
+  t_min: 0.02             # snapshots before this are flagged -1 (ignored): the waves are too close together
+  tau_s: 0.02             # shock: pressure jump g_p > tau_s ...
+  tau_v: 0.005            # ... with compression g_v < -tau_v
+  tau_c: 0.02             # contact: density jump g_rho > tau_c ...
+  tau_c_p: 0.005          # ... at nearly constant pressure g_p < tau_c_p

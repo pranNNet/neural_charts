@@ -1,0 +1,31 @@
+# Model Parameters
+# Read by ----- / ----- / Sod_Shock_Tube_Validation.py (all take --config).
+
+architecture:
+  ablation:
+    geometry: levelset  # levelset | none
+    jump_mode: RH       # RH | free
+    fourier: "on"       # on | off
+    head: softplus      # softplus | linear
+  latent:
+    z_geo: 4
+    z_field: 32
+
+encoder:
+  encodernet:
+    input: 3
+    hidden_layers: [64, 64, 64]
+
+geometry:
+  norm_delta: 1.0e-2      # delta in phi_hat, x~ units
+  geometrynet:
+    hidden_layers: [128, 128, 128]
+    phi_output: 5
+
+field:
+  eps0: 0.1
+  eps_min: 0.004
+
+
+output:
+  save_path: results\models\NChart_test_1

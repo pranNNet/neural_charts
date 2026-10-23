@@ -1,2 +1,3 @@
 # neural_charts
-Level-set approach to rend the shock from the flow field
+Using level-sets to remove the discontinuities (shocks, interfaces) from continous neural predictions.
+
