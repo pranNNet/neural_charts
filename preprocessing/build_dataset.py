@@ -22,7 +22,7 @@ from euler1d_data.infrastructure.solver_config import cons_to_prim
 from preprocessing.jump_flags import jump_flags
 from preprocessing.exact import exact_cell_averages
 
-DEFAULT_CONFIG = Path(__file__).parent / 'configs' / 'preprocessing_config.yaml'
+DEFAULT_CONFIG = Path(__file__).parent.parent / 'configs' / 'preprocessing_config.yaml'
 
 
 def load_config(path):

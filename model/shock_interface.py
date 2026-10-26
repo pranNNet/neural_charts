@@ -75,7 +75,7 @@ def char_speeds(W: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
 
 
 def detect_shocks(W_a, W_b, n, s, gamma: float = 1.4, mn_floor=0.5, beta: float = 50.0,
-                  tau_p: float = 0.05) -> dict:
+                  tau_p: float = 0.10, mn_gate: float = 1.05) -> dict:
     """Classify each front as a shock or not, and give the RH state behind each shock.
  
     W_a, W_b [F, 3]: the fields of the zones left (a) and right (b) of each front, read at the
@@ -85,10 +85,12 @@ def detect_shocks(W_a, W_b, n, s, gamma: float = 1.4, mn_floor=0.5, beta: float 
     Upstream is the low-pressure side. n_ud points upstream -> downstream, and s_ud is the normal
     speed along n_ud. A front is a shock when p_down > (1 + tau_p) p_up and the flow compresses,
     (v_down - v_up) * n_ud < 0. That is a discrete decision, with no gradient.
++    [FIX 1] It must also pass the Lax test Mn_raw > mn_gate (shock frame, from W_up, n_ud, s_ud):
++    a contact has Mn = 0 and a fan edge |Mn| = 1, so neither passes. mn_gate=None turns it off.
     Sod check: shock between zone 3 (a, left) and 4 (b, right): upstream = b, n_ud = -1,
     v_down - v_up = u* > 0, so the compression test holds.
  
-    Returns [F] tensors: is_shock (bool), up_is_a (bool), n_ud, s_ud, W_up [F, 3],
+    Returns [F] tensors: is_shock (bool), up_is_a (bool), n_ud, s_ud, W_up [F, 3], W_dn [F, 3],
     W_RH [F, 3] and Mn_raw, Mn_eff [F]. The last three are NaN where is_shock is False:
     the RH map is only evaluated at shocks.
     """
@@ -100,6 +102,9 @@ def detect_shocks(W_a, W_b, n, s, gamma: float = 1.4, mn_floor=0.5, beta: float 
  
     with torch.no_grad():
         is_shock = (W_dn[:, 2] > (1 + tau_p) * W_up[:, 2]) & ((W_dn[:, 1] - W_up[:, 1]) * n_ud < 0)
+        if mn_gate is not None:                                              # [FIX 1] Lax gate
+            Mn_all = (W_up[:, 1] * n_ud - s_ud) / torch.sqrt(gamma * W_up[:, 2] / W_up[:, 0])
+            is_shock &= Mn_all > mn_gate
  
     F = W_a.shape[0]
     idx = torch.nonzero(is_shock).squeeze(1)
@@ -110,7 +115,7 @@ def detect_shocks(W_a, W_b, n, s, gamma: float = 1.4, mn_floor=0.5, beta: float 
     Mn_eff = W_up.new_full((F,), nan).index_put((idx,), mn_effective(Mn_s, mn_floor, beta))
  
     return {"is_shock": is_shock, "up_is_a": up_is_a, "n_ud": n_ud, "s_ud": s_ud,
-            "W_up": W_up, "W_RH": W_RH, "Mn_raw": Mn_raw, "Mn_eff": Mn_eff}
+            "W_up": W_up, "W_dn": W_dn, "W_RH": W_RH, "Mn_raw": Mn_raw, "Mn_eff": Mn_eff}
 
 
 

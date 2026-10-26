@@ -42,4 +42,4 @@ output:
   gzip_level: 4
 
 execution:
-  workers: 8            # worker processes, one case each at a time; null = all cores
+  workers: 4            # worker processes, one case each at a time; null = all cores

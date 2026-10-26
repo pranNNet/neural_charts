@@ -24,15 +24,14 @@ class LatentEncoder(nn.Module):
         layers = []
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i+1]))
+            layers.append(act())
 
-            if i < len(dims) - 2:
-                layers.append(act())
-
-        self.net = nn.Sequential(*layers)
+        self.body = nn.Sequential(*layers)
+        self.head_geo = nn.Linear(dims[-1], z_geo)
+        self.head_field = nn.Linear(dims[-1], z_field)
 
     def forward(self, x):
-        return self.net(x.to(torch.float32))
-
-
+        y = self.body(x.to(torch.float32))
+        return self.head_geo(y), self.head_field(y)
 
 

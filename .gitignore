@@ -226,4 +226,6 @@ __marimo__/
 # Data
 .h5
 data
-
+results
+logs
+diagnostics

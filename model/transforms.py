@@ -34,5 +34,4 @@ def build_B(bands, seed, fourier):
     fourier off -> n_freq = 0, so fourier_features returns just [x~, t~]."""
     if not fourier:
         return torch.zeros(2, 0)
-    return make_B([(n, tuple(sig)) for n, sig in bands], seed)
-
+    return make_B([(b["n_freq"], (b["sigma_x"], b["sigma_t"])) for b in bands], seed)

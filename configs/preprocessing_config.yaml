@@ -3,11 +3,11 @@
 
 paths:                    # relative to this file; --raw and --out override them
   raw: ../euler1d_data/data/step1_sod_pr_raw.h5
-  out: ./data/step1_sod_pr.h5
+  out: ../data/step1_sod_pr.h5
 
 T_train: 0.16             # training horizon: train on t <= T_train; (T_train, t_max] is held out
 
-workers: 8                # worker processes, one case each at a time; null = all cores
+workers: 4                # worker processes, one case each at a time; null = all cores
 
 jump_flags:               # face tests on normalized jumps (jump_flags.py); thresholds are guesses to tune
   t_min: 0.02             # snapshots before this are flagged -1 (ignored): the waves are too close together

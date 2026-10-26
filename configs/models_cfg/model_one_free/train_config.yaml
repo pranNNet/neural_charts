@@ -1,0 +1,43 @@
+# Model Parameters
+# Read by ----- / ----- / Sod_Shock_Tube_Validation.py (all take --config).
+
+architecture:
+  ablation:
+    geometry: levelset  # levelset | none
+    jump_mode: free       # RH | free
+    fourier: "on"       # on | off
+
+split:
+  train: 
+    batch_size: 64
+  validate:
+    batch_size: 80
+
+geometry:
+  epochs: 500
+  lr: 1.0e-2
+  lr_min: 1.0e-5
+  warmup_steps: 2000
+  eps0: 0.1
+  eps_min: 0.004
+
+field:
+  epochs: 750
+  lr: 5.0e-3
+  lr_min: 1.0e-5
+  warmup_steps: 2000
+
+finetune:
+  epochs: 300
+  geo_lr: 1.0e-4
+  field_lr: 1.0e-4
+  lr_min: 1.0e-6
+  eps: 0.004
+
+misc:
+  lambdaZ: 1.0e-5
+  grad_clip: 1.0
+
+path:
+  data_path: ./data/step1_sod_pr.h5
+  save_path: ./results/models

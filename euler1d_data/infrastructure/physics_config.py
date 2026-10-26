@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
-from infrastructure.results import ExactRiemannSolver
+from euler1d_data.infrastructure.results import ExactRiemannSolver
 
 
 split_generator = np.random.default_rng(seed = 12345)

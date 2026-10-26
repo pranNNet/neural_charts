@@ -1,6 +1,6 @@
 # Model Parameters
 # Read by ----- / ----- / Sod_Shock_Tube_Validation.py (all take --config).
-
+name: test_model_1
 architecture:
   ablation:
     geometry: levelset  # levelset | none
@@ -10,10 +10,11 @@ architecture:
   latent:
     z_geo: 4
     z_field: 32
+  coordinate_input: 2
 
 encoder:
   encodernet:
-    input: 3
+    input: 1
     hidden_layers: [64, 64, 64]
 
 geometry:
@@ -52,6 +53,7 @@ physics:
     beta: 50.0
   fronts:
     N_search: 512
+    search_chunk: null
     k: 3.125 #L/(2*T_ref*u_ref)
     tau_p: 0.05 #pressure-rise threshold for definingn a front as shock
   scaling:
@@ -62,6 +64,3 @@ physics:
     Ly: 1.0
     t_ref: 0.24
 
-
-output:
-  save_path: results\models\NChart_test_1
