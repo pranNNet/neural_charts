@@ -1,6 +1,6 @@
 # Model Parameters
 # Read by ----- / ----- / Sod_Shock_Tube_Validation.py (all take --config).
-name: test_model_1
+name: test_model_1D
 architecture:
   ablation:
     geometry: levelset  # levelset | none
@@ -10,7 +10,7 @@ architecture:
   latent:
     z_geo: 4
     z_field: 32
-  coordinate_input: 2
+  coordinate_input: 2 # D+1: 2 for (x, t), 3 for (x, y, t)
 
 encoder:
   encodernet:
@@ -20,7 +20,7 @@ encoder:
 geometry:
   norm_delta: 1.0e-2      # delta in phi_hat, x~ units
   fourierfeatures:
-    seed: 0
+    seed: 0 # 2D: add sigma_y to each band
     bands:
       - {n_freq: 16, sigma_x: 1.0, sigma_t: 0.5}
   geometrynet:
@@ -29,8 +29,6 @@ geometry:
 
 field:
   eps: 0.004
-  # eps0: 0.1
-  # eps_min: 0.004
   fourierfeatures:
     seed: 1
     bands:
@@ -40,7 +38,7 @@ field:
   fieldnet:
     regions: 5 #number of zones, also listed as K
     hidden_layers: [128, 128, 128, 128]
-    field_output: 3
+    field_output: 3 # (rho, v, p); 4 in 2D: (rho, vx, vy, p)
     N_dist: 4 #distance features per interface
     N_e: 8 # N_e-number ID for each zone k
     
@@ -49,13 +47,14 @@ physics:
   constants:
     gamma: 1.4
   jump: 
-    Mn_floor: 0.5
-    beta: 50.0
+    Mn_gate: 1.05
+    width: 0.03125  # x~, constraint at full strength out to here (8 cells); must be >= side_offset. Guess to tune
+    taper: 0.015625 # x~, cosine taper to 0 after width (4 cells). Guess to tune
   fronts:
-    N_search: 512
-    search_chunk: null
     k: 3.125 #L/(2*T_ref*u_ref)
-    tau_p: 0.05 #pressure-rise threshold for definingn a front as shock
+    tau_p: 0.10 #pressure-rise threshold for definingn a front as shock
+    side_offset: 0.015625 # = 4 cells in x~ (4 · 2/512)
+    t_min: 0.125 # t~ = 0.02 / 0.16
   scaling:
     rho_ref: 0.1
     u_ref: 1.0 #fill in with speed of sound

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-from model.transforms import make_B, MSFourier_Features
 # ======================================================================================
 # Region Embedding
 # ======================================================================================
@@ -64,7 +63,7 @@ class FieldNet(nn.Module):
 
     def __init__(self, N_in, N_regions,
                  N_z_field, N_e_field, N_dist,
-                 hidden_layers):
+                 hidden_layers, N_out = 3):
         super().__init__()
 
         self.N_dist = N_dist
@@ -77,7 +76,7 @@ class FieldNet(nn.Module):
         self.layers = nn.ModuleList(
             [FiLMLayer(N_in, hidden_layers[0], N_z_field, N_e_field)] + 
             [FiLMLayer(N_features, N_features, N_z_field, N_e_field) for N_features in hidden_layers[1:]] +
-            [nn.Linear(hidden_layers[-1], 3)]
+            [nn.Linear(hidden_layers[-1], N_out)]   # (rho, v_1..v_D, p)
         )
 
     def forward(self, x, z_field, dist = None):
@@ -99,7 +98,8 @@ class FieldNet(nn.Module):
 
 def positive_clamp(R):
 
-    rho = nn.functional.softplus(R[..., 0])+1e-6
-    u = R[..., 1]
-    P = nn.functional.softplus(R[..., 2]) + 1e-6
-    return torch.stack([rho, u, P], dim=-1)
+    # R = (rho, v_1..v_D, p): softplus on rho and p, velocity left free
+    rho = nn.functional.softplus(R[..., :1])+1e-6
+    u = R[..., 1:-1]
+    P = nn.functional.softplus(R[..., -1:]) + 1e-6
+    return torch.cat([rho, u, P], dim=-1)
