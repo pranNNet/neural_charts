@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-from model.transforms import make_B, MSFourier_Features
 # ======================================================================================
 # Region Embedding
 # ======================================================================================
@@ -61,45 +60,49 @@ class FiLMLayer(nn.Module):
 # ======================================================================================
 
 class FieldNet(nn.Module):
+    '''
+    Shared bases: a trunk conditioned on z_field gives N_bases functions of x per output,
+    and each region k mixes them with its own coefficients from [z_field; e_k].
+        W_kc(x) = sum_m a_kmc * b_mc(x)
+    '''
 
     def __init__(self, N_in, N_regions,
-                 N_z_field, N_e_field, N_dist,
-                 hidden_layers):
+                 N_z_field, N_e_field,
+                 hidden_layers, N_out = 3, N_bases = 16):                 # AUDIT 7: no N_dist
         super().__init__()
 
-        self.N_dist = N_dist
-
-        N_in = N_in + N_dist
+        self.N_out, self.N_bases = N_out, N_bases
 
         self.embed = RegionEmbedding(N_regions, N_e_field)
 
-
+        # trunk: FiLM on z_field only (N_e = 0), runs once per point
         self.layers = nn.ModuleList(
-            [FiLMLayer(N_in, hidden_layers[0], N_z_field, N_e_field)] + 
-            [FiLMLayer(N_features, N_features, N_z_field, N_e_field) for N_features in hidden_layers[1:]] +
-            [nn.Linear(hidden_layers[-1], 3)]
+            [FiLMLayer(N_in, hidden_layers[0], N_z_field, 0)] +
+            [FiLMLayer(N_features, N_features, N_z_field, 0) for N_features in hidden_layers[1:]] +
+            [nn.Linear(hidden_layers[-1], N_bases * N_out)]       # the bases b_mc(x)
         )
 
-    def forward(self, x, z_field, dist = None):
+        # per-region coefficients a_kmc from [z_field; e_k], nonlinear in z (AUDIT test: was one Linear)
+        self.coeff = nn.Sequential(nn.Linear(N_z_field + N_e_field, hidden_layers[-1]), nn.SiLU(),
+                                   nn.Linear(hidden_layers[-1], N_bases * N_out))
+        with torch.no_grad():
+            self.coeff[-1].bias.fill_(1 / N_bases)       # ⚑ each region starts near the mean of the bases
 
-        if dist is None:
-            dist = x.new_zeros(x.shape[0], self.N_dist)
-
-        x = torch.cat([x, dist], dim=-1) # [N, 134] w/ fourier features
-
-        e = self.embed() # [K, 8]
-        cond = build_cond(z_field, e) # [N, K, 40]
-
-        x = x.unsqueeze(1).expand(-1, e.shape[0], -1) # [N, K, 134] - one copy per zone
+    def forward(self, x, z_field):                                         # AUDIT 7: no dist input
 
         for layer in self.layers[0:-1]:
-            x = layer(x, cond)
-        return self.layers[-1](x)
+            x = layer(x, z_field)                                          # [N, H]
 
+        N = x.shape[0]
+        b = self.layers[-1](x).view(N, self.N_bases, self.N_out)                         # [N, M, F]
+        e = self.embed()                                                   # [K, N_e]
+        a = self.coeff(build_cond(z_field, e)).view(N, e.shape[0], self.N_bases, self.N_out)  # [N, K, M, F]
+        return torch.einsum('nkmf,nmf->nkf', a, b)                         # [N, K, F]
 
 def positive_clamp(R):
 
-    rho = nn.functional.softplus(R[..., 0])+1e-6
-    u = R[..., 1]
-    P = nn.functional.softplus(R[..., 2]) + 1e-6
-    return torch.stack([rho, u, P], dim=-1)
+    # R = (rho, v_1..v_D, p): softplus on rho and p, velocity left free
+    rho = nn.functional.softplus(R[..., :1])+1e-6
+    u = R[..., 1:-1]
+    P = nn.functional.softplus(R[..., -1:]) + 1e-6
+    return torch.cat([rho, u, P], dim=-1)

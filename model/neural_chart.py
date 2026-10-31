@@ -1,24 +1,36 @@
-import yaml
-from functools import partial
-
 import torch
 import torch.nn as nn
 
-from model.transforms import build_B, make_B, MSFourier_Features
-from model.geometry import LevelSetsNet
+from model.transforms import build_B, MSFourier_Features
+from model.geometry import LevelSetsNet, front_frame, front_distances, advect, advect_scores   # AUDIT 3, 1 fix
 from model.region import FieldNet, positive_clamp
-from model.shock_interface import Rankine_Hugoniot, detect_shocks
-from model.helper import phi_and_slope, search_points, find_fronts, split_fronts
+from model.shock_interface import interface_speed, constrain_shocks
 
 # ======================================================================================
-# FieldNet
+# Helpers
+# ======================================================================================
+
+def sample_grid(W_grid, rows, u):
+    """Input field at x~ positions u [P, 1] of batch rows [P], linear between cell centres and clamped
+    to the end cells. W_grid [B, C, N_grid] -> [P, C]."""
+    N = W_grid.shape[-1]
+    f = ((u[:, 0] + 1) * N / 2 - 0.5).clamp(0, N - 1)         # continuous cell index
+    i0 = f.floor().long().clamp(max = N - 2)
+    w = (f - i0)[:, None]
+    return (1 - w) * W_grid[rows, :, i0] + w * W_grid[rows, :, i0 + 1]
+
+# ======================================================================================
+# NeuralChart step map: W(t_n) -> W(t_n+1).  GEOMETRY -> FIELD -> JUMP (speed, advect, constrain) -> BLEND
 # ======================================================================================
 
 class NeuralChart1DST(nn.Module):
 
     def __init__(self, config: dict, 
-                 N_input = 2):
+                 N_input = None):
         super().__init__()
+
+        # number of coordinates, D+1 = (space..., t)
+        N_input = N_input or config['architecture']['coordinate_input']
 
         #parameters for ablations
         self.geo_mode = config['architecture']['ablation']['geometry'].lower()
@@ -30,7 +42,6 @@ class NeuralChart1DST(nn.Module):
         assert self.geo_mode.lower() in ("levelset", "none")
         assert self.jump_mode.lower() in ("rh", "free") and self.head in ("softplus", "linear")
 
-
         geo_cfg = config['geometry']
         field_cfg = config['field']
 
@@ -40,239 +51,144 @@ class NeuralChart1DST(nn.Module):
             #bands for multi-scale fourier features
             self.B_geo = build_B(bands = geo_cfg['fourierfeatures']['bands'],
                                  seed = geo_cfg['fourierfeatures']['seed'],
-                                 fourier=self.fourier
+                                 fourier=self.fourier,
+                                 N_input = N_input
                                  )
 
             self.B_field = build_B(bands = field_cfg['fourierfeatures']['bands'],
                                    seed = field_cfg['fourierfeatures']['seed'],
-                                   fourier=self.fourier
+                                   fourier=self.fourier,
+                                   N_input = N_input
                                    )
 
-
-            self.LevelSetsNet = LevelSetsNet(N_in = N_input + N_input*self.B_geo.shape[1],
+            self.LevelSetsNet = LevelSetsNet(N_in = N_input + 2*self.B_geo.shape[1],
                                             z_geo = config['architecture']['latent']['z_geo'],
                                             N_out = geo_cfg['geometrynet']['phi_output'],
                                             hidden_layers = geo_cfg['geometrynet']['hidden_layers']
                                             )
 
-            self.FieldNet = FieldNet(N_in = N_input + N_input*self.B_field.shape[1],
+            self.FieldNet = FieldNet(N_in = N_input + 2*self.B_field.shape[1],
                                      N_regions = field_cfg['fieldnet']['regions'],
                                      N_z_field = config['architecture']['latent']['z_field'],
                                      N_e_field = field_cfg['fieldnet']['N_e'],
-                                     N_dist = field_cfg['fieldnet']['N_dist'],
-                                     hidden_layers = field_cfg['fieldnet']['hidden_layers']
+                                     hidden_layers = field_cfg['fieldnet']['hidden_layers'],
+                                     N_out = field_cfg['fieldnet']['field_output'],
+                                     N_bases = field_cfg['fieldnet']['n_bases']
                                      )
-            # relevant parameters for combinations
-            self.norm_delta = geo_cfg['norm_delta']
-            self.N_search = config['physics']['fronts']['N_search'] # numb. of sample points for shock search
-            self.search_chunk = config['physics']['fronts']['search_chunk']
-            self.k = config['physics']['fronts']['k'] #convert normalzed shock speed to field units
-
-            self.gamma = config['physics']['constants']['gamma']
-            self.mn_floor = config['physics']['jump']['Mn_floor']
-            self.beta = config['physics']['jump']['beta']
-            self.tau_p = config['physics']['fronts']['tau_p']
-            # [FIX 1-3] new keys, with defaults so old yamls still load
-            self.mn_gate = config['physics']['jump'].get('Mn_gate', 1.05)                  # Lax gate on is_shock
-            self.side_offset = config['physics']['fronts'].get('side_offset', 4 * 2 / 512)  # x~, 4 cells
-            self.t_min = config['physics']['fronts'].get('t_min', 0.02 / 0.16)             # t~, as jump_flags
- 
+            # shock constraint (JUMP module)
+            jump_cfg, front_cfg = config['physics']['jump'], config['physics']['fronts']
+            dx = 2 / config['encoder']['N_grid']                    # cell size in x~: config lengths are in cells
+            self.shock_cfg = {
+                'gamma': config['physics']['constants']['gamma'],
+                'tau_p': front_cfg['tau_p'],                         # pressure-rise threshold
+                'Mn_gate': jump_cfg.get('Mn_gate', 1.05),            # Lax gate
+                'side_offset': front_cfg['side_offset'] * dx,        # x~, plateau read distance
+                'width': jump_cfg['width'] * dx,                     # x~, full-strength constraint
+                'taper': jump_cfg['taper'] * dx,                     # x~, cosine taper after width
+            }
+            self.speed_rel_tol = jump_cfg['speed_rel_tol']           # interface_speed fallback
+            self.dt_x = 2 * config['physics']['time']['dt'] / config['physics']['scaling']['Lx']   # x~ per unit speed per step
+            assert self.shock_cfg['width'] >= self.shock_cfg['side_offset'], "pin point must lie inside width"
+            assert self.shock_cfg['taper'] > 0
 
         else:
             # Baseline comparison (no Level Set Functionality)
-
 
             #bands for multi-scale fourier features
             self.B_geo, self.LevelSetsNet = None, None
 
             self.B_field = build_B(bands = field_cfg['fourierfeatures']['bands'],
                                    seed = field_cfg['fourierfeatures']['seed'],
-                                   fourier=self.fourier
+                                   fourier=self.fourier,
+                                   N_input = N_input
                                    )
 
-
-            self.FieldNet = FieldNet(N_in = N_input + N_input*self.B_field.shape[1],
+            self.FieldNet = FieldNet(N_in = N_input + 2*self.B_field.shape[1],
                                      N_regions = 1,
                                      N_z_field = config['architecture']['latent']['z_field'] + config['architecture']['latent']['z_geo'],
                                      N_e_field = 1,
-                                     N_dist = 0,
-                                     hidden_layers = field_cfg['fieldnet']['hidden_layers']
+                                     hidden_layers = field_cfg['fieldnet']['hidden_layers'],
+                                     N_out = field_cfg['fieldnet']['field_output'],
+                                     N_bases = field_cfg['fieldnet']['n_bases']
                                      )
 
-
-        self.RH_map = partial(Rankine_Hugoniot,
-                              gamma = config['physics']['constants']['gamma'],
-                              beta = config['physics']['jump']['beta'],
-                              mn_floor = config['physics']['jump']['Mn_floor']
-                              )
-
-
     def geo_phi(self, u, z):
-        """u [P, 2] normalized (x~, t~), z [P, z_geo] -> phi [P, K]. Same call as in forward."""
+        """u [P, D] normalized space, z [P, z_geo] -> phi [P, K]. Same call as in forward."""
         return self.LevelSetsNet(MSFourier_Features(u, self.B_geo), z)
-
 
     def heads_fn(self, h):
         """S.6, switched by `heads`. linear: rho = h1, p = h3 (positivity ablation, §6)."""
         return positive_clamp(h) if self.head == "softplus" else h
 
+    def geometry(self, x, z_geo):
+        """GEOMETRY at t_n: raw scores phi [N, K], detached unless the geometry trains. Used alone in stage 1.
+        The owner of a point is phi.argmax(-1); phi is not a distance (front_frame gives those)."""
+        train_geo = torch.is_grad_enabled() and any(p.requires_grad for p in self.LevelSetsNet.parameters())
+        phi = self.geo_phi(x, z_geo)                                       # AUDIT 3: plain forward
+        return phi if train_geo else phi.detach()
 
-    # def fronts_for_group(self, x, z_geo, z_field, in_g, train_geo) -> dict:
-    #     """Fronts of one (case, time) group, and which of them are shocks.
- 
-    #     Returns find_fronts' dict (x, dxdt, n, s, a, b) plus detect_shocks' keys
-    #     (is_shock, up_is_a, n_ud, s_ud, W_up, W_RH, Mn_raw, Mn_eff), all of length F.
-    #     """
-    #     # Every point of a group shares one case and one time: read them off the first point.
-    #     first = torch.nonzero(in_g)[0, 0]
-    #     t_g = x[first, 1].detach()
-    #     z_geo_g, z_field_g = z_geo[first], z_field[first]
- 
-    #     # 1. Where the regions change along x~ at this time.
-    #     x_search = search_points(self.N_search).to(x)
-    #     fr = find_fronts(self.geo_phi, z_geo_g, t_g, x_search,
-    #                      self.k, self.norm_delta, train_geo)
- 
-    #     # 2. The state each side's region predicts at the front point.
-    #     F = len(fr['x'])
-    #     u = torch.stack([fr['x'], t_g.expand(F)], dim=-1)                       # [F, 2]
-    #     W_front = self.heads_fn(self.FieldNet(MSFourier_Features(u, self.B_field),
-    #                                           z_field_g.expand(F, -1)))          # [F, K, 3]
- 
-    #     rows = torch.arange(F, device=x.device)
-    #     W_a = W_front[rows, fr['a']]                                            # [F, 3] left side
-    #     W_b = W_front[rows, fr['b']]                                            # [F, 3] right side
- 
-    #     # 3. Shocks: pressure rise with compression. Gives the RH state behind each, and Mn.
-    #     fr.update(detect_shocks(W_a, W_b, fr['n'], fr['s'], self.gamma,
-    #                             self.mn_floor, self.beta, self.tau_p))
-    #     return fr
- 
-    # def overwrite_shocked_zones(self, W_regions, fr, in_g, g):
-    #     """In place: the region behind each shock takes that shock's RH state at every point
-    #     of the group. The RH state is constant in x, which is exact for Sod's star-right region.
-    #     """
-    #     done = set()
-    #     for f in torch.nonzero(fr['is_shock']).squeeze(1).tolist():
- 
-    #         # downstream = the high-pressure side of the shock
-    #         down = int(fr['b'][f] if fr['up_is_a'][f] else fr['a'][f])
- 
-    #         # Open case (D78): a region behind two shocks keeps the first one.
-    #         if down in done:
-    #             print(f"warning: region {down} is behind two shocks in group {g}; keeping the first")
-    #             continue
-    #         done.add(down)
- 
-    #         W_regions[in_g, down] = fr['W_RH'][f]
+    def jump_step(self, x, rows, z_geo, z_field, phi, W_regions, W_grid, train_geo):
+        """JUMP module. Band points get their front frame at t_n, the front speed from the input field,
+        then advection to t_n+1 and the shock constraint there. 'free' runs it for the hooks but
+        changes nothing. Returns (W_regions, jump, phi_next)."""
+        cfg = self.shock_cfg
+        reach = cfg['width'] + cfg['taper']
+        d = phi.detach().argmax(dim=-1)                         # own zone
 
-    def fronts_all_groups(self, x, z_geo, z_field, group, train_geo):
-        """Fronts of every (case, time) group in one pass, and which of them are shocks.
- 
-        Returns (fr, uniq, inv). fr is find_fronts' flat dict (g, x, dxdt, n, s, a, b) plus
-        detect_shocks' keys (is_shock, up_is_a, n_ud, s_ud, W_up, W_RH, Mn_raw, Mn_eff), all of
-        length F = total fronts. fr['g'] indexes uniq (the sorted group ids); inv [N] maps each
-        point to its row of uniq.
-        """
-        # Every point of a group shares one case and one time: read them off its first point.
-        uniq, inv = torch.unique(group, return_inverse=True)
-        N = len(group)
-        ar = torch.arange(N, device=x.device)
-        first = torch.full((len(uniq),), N, device=x.device, dtype=torch.long).scatter_reduce(
-            0, inv, ar, reduce='amin')                                          # [G]
-        t_g = x[first, 1].detach()
-        z_geo_g, z_field_g = z_geo[first], z_field[first]
- 
-        # 1. Where the regions change along x~, all groups' search grids stacked.
-        x_search = search_points(self.N_search).to(x)
-        fr = find_fronts(self.geo_phi, z_geo_g, t_g, x_search,
-                         self.k, self.norm_delta, train_geo, self.search_chunk)
- 
-        # 2. [FIX 2] The state each side's region predicts side_offset away from the front
-        #    (zone a at x - d, zone b at x + d), so the plateau is read and not the smeared ramp.
-        #    One FieldNet call on both sides stacked.
-        F = len(fr['x'])
-        # u = torch.stack([fr['x'], t_g[fr['g']]], dim=-1)                        # [F, 2]
-        # W_front = self.heads_fn(self.FieldNet(MSFourier_Features(u, self.B_field),
-        #                                       z_field_g[fr['g']]))               # [F, K, 3]
-        d = self.side_offset
-        t_f = t_g[fr['g']]
-        u = torch.stack([torch.cat([(fr['x'] - d).clamp(-1, 1), (fr['x'] + d).clamp(-1, 1)]),
-                         t_f.repeat(2)], dim=-1)                                   # [2F, 2]
-        W_side = self.heads_fn(self.FieldNet(MSFourier_Features(u, self.B_field),
-                                             z_field_g[fr['g']].repeat(2, 1)))     # [2F, K, 3]
- 
-        rows = torch.arange(F, device=x.device)
-        # W_a = W_front[rows, fr['a']]                                            # [F, 3] left side
-        # W_b = W_front[rows, fr['b']]                                            # [F, 3] right side
- 
-        # # 3. Shocks: pressure rise with compression. Gives the RH state behind each, and Mn.
-        W_a = W_side[:F][rows, fr['a']]                                         # [F, 3] left side, at x - d
-        W_b = W_side[F:][rows, fr['b']]                                         # [F, 3] right side, at x + d
-        fr.update(detect_shocks(W_a, W_b, fr['n'], fr['s'], self.gamma,
-                                self.mn_floor, self.beta, self.tau_p, self.mn_gate))
+        # AUDIT 1 fix: j is the zone across the nearest front that is there (label check built in), chosen
+        # by distance. The score rank says nothing about which zone is adjacent. Band points at t_n: a front
+        # moves at most reach per step (advect), so dist <= 2 * reach can end within reach at t_n+1
+        near, zones = front_distances(self.geo_phi, x, z_geo, d, cfg['side_offset']).topk(2, dim=-1, largest=False)
+        j = zones[:, 0]
+        idx = torch.nonzero(near[:, 0] <= 2 * reach).squeeze(1)
+        z_band = z_geo[idx]
+        frame = front_frame(lambda u: self.geo_phi(u, z_band), x[idx], d[idx], j[idx], train_geo)
 
-        # 4. [FIX 3] No shocks before t_min: the geometry is never trained there (jump_flags = -1).
-        fr['is_shock'] = fr['is_shock'] & (t_f >= self.t_min)
-        return fr, uniq, inv
- 
- 
-    def overwrite_shocked_zones(self, W_regions, fr, inv, uniq):
-        """The region behind each shock takes that shock's RH state at every point of its group.
-        The RH state is constant in x, which is exact for Sod's star-right region.
-        Returns a new W_regions (out of place, so no clone is needed); gradients reach W_RH as before.
-        """
-        sh = torch.nonzero(fr['is_shock']).squeeze(1)
-        # downstream = the high-pressure side of the shock
-        down = torch.where(fr['up_is_a'][sh], fr['b'][sh], fr['a'][sh])
- 
-        # # Open case (D78): a region behind two shocks keeps the first one (fronts run left to right).
-        # keep, done = [], set()
-        # for f, gj, d in zip(sh.tolist(), fr['g'][sh].tolist(), down.tolist()):   # one sync, few shocks
-        #     if (gj, d) in done:
-        #         print(f"warning: region {d} is behind two shocks in group {uniq[gj].item()}; keeping the first")
-        #         continue
-        #     done.add((gj, d))
-        #     keep.append(f)
+        # time-n reads at the pin (own side) and the other side
+        P = len(idx)
+        step = cfg['side_offset'] * frame['n']
+        u = torch.cat([frame['x_foot'] - step, frame['x_foot'] + step]).clamp(-1, 1)    # [2P, D]
+        u = u.detach()                                     # reads only: no gradient through where they sit
+        W_in = sample_grid(W_grid, rows[idx].repeat(2), u)
+        W_in_d, W_in_j = W_in[:P], W_in[P:]
 
-        # [FIX 4] Open case (D78): a region behind two or more shocks is ambiguous, so it is not
-        # overwritten at all (it keeps its free field). Counted in self.n_conflicts, not printed.
-        pairs = list(zip(sh.tolist(), fr['g'][sh].tolist(), down.tolist()))     # one sync, few shocks
-        count = {}
-        for _, gj, d in pairs:
-            count[(gj, d)] = count.get((gj, d), 0) + 1
-        keep = [f for f, gj, d in pairs if count[(gj, d)] == 1]
-        self.n_conflicts = sum(1 for c in count.values() if c > 1)
-        if not keep:
-            return W_regions
- 
-        keep = torch.tensor(keep, device=W_regions.device)
-        gk = fr['g'][keep]
-        dk = torch.where(fr['up_is_a'][keep], fr['b'][keep], fr['a'][keep])
-        G, K = len(uniq), W_regions.shape[1]
- 
-        # [G, K] table of the RH state per (group, region), and where it applies
-        table = W_regions.new_zeros(G, K, 3).index_put((gk, dk), fr['W_RH'][keep])
-        hit = torch.zeros(G, K, dtype=torch.bool, device=W_regions.device).index_put(
-            (gk, dk), torch.tensor(True, device=W_regions.device))
-        return torch.where(hit[inv].unsqueeze(-1), table[inv], W_regions)
- 
+        # speed from the input field, then advect the fronts and the scores to t_n+1
+        s = interface_speed(W_in_d, W_in_j, frame['n'], self.speed_rel_tol)
+        frame_next, d_next, j_next, s_next, flipped = advect(frame, d[idx], j[idx], s, self.dt_x, reach)
+        phi_next = advect_scores(phi, idx, d[idx], j[idx], frame_next['shift'] * frame['norm'])
+        W_in_d, W_in_j = (torch.where(flipped[:, None], W_in_j, W_in_d),     # seen from the new owner
+                          torch.where(flipped[:, None], W_in_d, W_in_j))
 
-    def forward(self, x, z_geo, z_field,
-                blend = 'hard',
-                eps: float = None,
-                group = None) -> dict:
+        # constrain only band points within reach at t_n+1 and not at a junction (label check is in front_distances)
+        junction = near[idx, 1] <= reach                       # AUDIT 2: 2nd-nearest front within reach
+        keep = (frame_next['dist'].detach() <= reach) & ~junction
+
+        def fields_at(v, r):
+            return self.heads_fn(self.FieldNet(MSFourier_Features(v, self.B_field), z_field[r]))
+
+        W_regions, jump = constrain_shocks(W_regions, idx[keep], d_next[keep], j_next[keep],
+                                           {key: val[keep] for key, val in frame_next.items()}, s_next[keep],
+                                           (W_in_d[keep], W_in_j[keep]), fields_at, cfg,
+                                           apply=self.jump_mode == 'rh')
+        jump.update(flipped=flipped[keep], junction_frac=junction.float().mean())
+        return W_regions, jump, phi_next
+
+    def forward(self, x, z_geo, z_field, W_grid, group) -> dict:     # AUDIT fix: no blend / eps (hard only)
 
         '''
         INPUT REQUIREMENTS
-        - x must be normalized
-        - z_geo and z_field must be precomputed vectors from the encoder
+        - x [N, D] normalized cell centres (space only), where W at t_n+1 is predicted
+        - z_geo and z_field [N, .] per point, from the encoder of the input step
+        - W_grid [B, C, N_grid] the input field at t_n (primitives); group [N] each point's row in W_grid
 
-        OUTPUT DESCRIPTION:
+        OUTPUT DESCRIPTION (all at t_n+1 unless marked):
         - W : Field Variables at coordinate
         - W_regions : What each regions predicts for the Field Variables
         - labels : the region the point is assigned too
-        - phi : geometry's score for each region
+        - phi_hat : geometry's raw score phi for each region (advected);  phi_hat_now : the same at t_n
+          (AUDIT 3: raw phi, not normalized; key names kept so evaluation/ still reads them)
+        - weights : one-hot blend weights from the labels
+        - jump : per band point hooks from the shock constraint (see constrain_shocks), None for 'none'
         '''
 
         N = x.shape[0]
@@ -286,88 +202,35 @@ class NeuralChart1DST(nn.Module):
             return {'W': W_regions[:, 0],
                     'W_regions': W_regions,
                     'labels': labels,
-                    # 'dphi_dx': None,
                     'phi_hat': None,
+                    'phi_hat_now': None,
                     'weights': x.new_ones(N, 1),
-                    'fronts': None}
-
+                    'jump': None}
 
         # for the LEVELSET MODEL
 
-        #forward GEOMETRY module
-        grad_on = torch.is_grad_enabled()
+        #forward GEOMETRY module, at t_n
+        phi_now = self.geometry(x, z_geo)
+        train_geo = phi_now.requires_grad
 
-        # graph needed for training
-        train_geo = grad_on and any(p.requires_grad for p in self.LevelSetsNet.parameters())
+        #forward FIELD module, at t_n+1
+        W_regions = self.heads_fn(self.FieldNet(MSFourier_Features(x, self.B_field), z_field))     # AUDIT 7
 
-        phi, dphi_dx = phi_and_slope(
-            phi_fn = lambda u: self.LevelSetsNet(MSFourier_Features(u, self.B_geo), z_geo),
-            x = x,
-            create_graph = train_geo
-        )
+        #forward JUMP module: front speed, advection to t_n+1, pinned RH constraint behind shocks
+        W_regions, jump, phi = self.jump_step(x, group, z_geo, z_field, phi_now,
+                                              W_regions, W_grid, train_geo)
 
-        # evaluation
-        if not train_geo:
-            phi, dphi_dx = phi.detach(), dphi_dx.detach()
-
-        phi_hat = phi/torch.sqrt(dphi_dx**2 + self.norm_delta**2)
-
-
-        #forward FIELD module
-        dist = x.new_zeros(N, self.FieldNet.N_dist)
-        W_regions = self.heads_fn(self.FieldNet(MSFourier_Features(x, self.B_field), z_field, dist))
-
-
-        # # JUMP: fronts and RH overwrite, one (case, time) group at a time
-        # fronts = None
-        # if group is not None:
-        #     fronts = []
-        #     W_regions = W_regions.clone()       # zones behind shocks are written into below
- 
-        #     for g in torch.unique(group).tolist():
-        #         in_g = group == g               # [N] bool: the points of this group
- 
-        #         fr = self.fronts_for_group(x, z_geo, z_field, in_g, train_geo)
- 
-        #         # 'free' still finds fronts and shocks (for the certificates) but overwrites nothing
-        #         if self.jump_mode == 'rh':
-        #             self.overwrite_shocked_zones(W_regions, fr, in_g, g)
- 
-        #         fronts.append(fr)
-
-        # ---- JUMP: fronts of all (case, time) groups at once, then the RH overwrite ----  [CLAUDE ADDED]
-        fronts = None
-        if group is not None:
-            fr, uniq, inv = self.fronts_all_groups(x, z_geo, z_field, group, train_geo)
- 
-            # 'free' still finds fronts and shocks (for the certificates) but overwrites nothing
-            if self.jump_mode == 'rh':
-                W_regions = self.overwrite_shocked_zones(W_regions, fr, inv, uniq)
- 
-            fronts = split_fronts(fr, len(uniq))     # one dict per group, in sorted group order
-
-
-
-        #ASSEMBLY
-        labels = phi_hat.argmax(dim=-1)
-        if blend == 'hard':
-            weights = nn.functional.one_hot(labels, phi_hat.shape[-1]).to(phi_hat)
-            W = torch.take_along_dim(W_regions, labels[:, None, None], dim=1).squeeze(1)
-
-        else:
-            weights = torch.softmax(phi_hat/eps, dim=-1)
-            W = (weights.unsqueeze(-1) * W_regions).sum(dim=1)
-
+        #BLEND (assembly), hard, with the advected scores. AUDIT fix: the soft blend is gone; trained against a
+        #~1 cell shock it made each zone field overshoot behind the front, and the hard-blend output kept it
+        labels = phi.argmax(dim=-1)
+        weights = nn.functional.one_hot(labels, phi.shape[-1]).to(W_regions)
+        W = (weights.unsqueeze(-1) * W_regions).sum(dim=1)
 
         return {'W': W,
                 'W_regions': W_regions,
                 'labels': labels,
-                'phi_hat': phi_hat,
-                # 'dphi_dx': dphi_dx,
-                'weights': weights, 
-                'fronts': fronts}
-
-
-
-
-
+                'phi_hat': phi,
+                'phi_hat_now': phi_now,
+                'weights': weights,
+                'jump': jump}
+    

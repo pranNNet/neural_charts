@@ -1,6 +1,6 @@
 # Training preprocessing
 
-This folder turns the **raw simulation file** into the **training file**. It runs no simulations. It only reads the raw file, keeps part of it, and adds two things derived from it: jump flags and the exact solution.
+This folder turns the **raw simulation file** into the **training file**. It runs no simulations. It only reads the raw file, keeps part of it, and adds three things derived from it: jump flags, cell classes and the exact solution.
 
 ```
 euler1d-data/data/step1_sod_pr_raw.h5  ──►  python -m preprocessing.build_dataset  ──►  preprocessing/data/step1_sod_pr.h5
@@ -19,21 +19,22 @@ python -m preprocessing.build_dataset --raw <raw.h5> --out <train.h5>   # other 
 python -m preprocessing.build_dataset --config <other.yaml>             # other settings
 ```
 
-The settings live in `preprocessing_config.yaml`: the input and output paths (relative to the YAML file), the number of worker processes (`workers`, null = all cores), `T_train`, and the thresholds for the jump flags. A copy of the YAML is saved inside the output file. The full set of 104 cases should take under a minute on 4 cores (each case takes about 1 s).
+The settings live in `preprocessing_config.yaml`: the input and output paths (relative to the YAML file), the number of worker processes (`workers`, null = all cores), `T_train`, and the thresholds for the jump flags and the classes. A copy of the YAML is saved inside the output file. The full set of 104 cases should take under a minute on 4 cores (each case takes about 1 s).
 
 | File | What it does |
 |---|---|
 | `preprocessing_config.yaml` | All the settings. |
 | `build_dataset.py` | Reads each case from the raw file, runs the steps in §2, writes the training file and prints a check for each case. |
 | `jump_flags.py` | Finds the cell faces where the data jumps (§2, step 3). |
-| `exact.py` | Computes the exact solution as cell averages (§2, step 4). |
+| `classes.py` | Labels each cell with where its gas came from and whether it was shocked (§2, step 4). |
+| `exact.py` | Computes the exact solution as cell averages (§2, step 5). |
 | `__init__.py` | Lets the package use two things from `euler1d-data/`: the conservative-to-primitive conversion and the exact Riemann solver. This is the only link between the two folders. |
 
 ---
 
 ## 2. What it does to the raw data
 
-The raw file stores, for each of the 104 cases, the solution at **every solver step**: `U_fv_steps` [S+1, 512, 3], conservative variables (ρ, ρv, E), with S between about 2,500 and 5,300 depending on the case. For each case, preprocessing does four things:
+The raw file stores, for each of the 104 cases, the solution at **every solver step**: `U_fv_steps` [S+1, 512, 3], conservative variables (ρ, ρv, E), with S between about 2,500 and 5,300 depending on the case. For each case, preprocessing does five things:
 
 1. **Keeps 121 snapshots.** It keeps only the steps at t = 0, 0.002, …, 0.24, using the raw file's `store_idx`. These are actual solver steps, not interpolated. [S+1, 512, 3] becomes [121, 512, 3].
 2. **Converts to primitives.** (ρ, ρv, E) becomes (ρ, v, p), with v = ρv/ρ and p = (γ − 1)(E − ½ρv²). The result is `W_fv` [121, 512, 3]. The values are **not** rescaled, normalized or smoothed: the data is already dimensionless, so the fields are used exactly as the solver produced them. The only change is that they are stored as float32.
@@ -46,13 +47,33 @@ The raw file stores, for each of the 104 cases, the solution at **every solver s
    - Snapshots with **t < 0.02** are set to −1 ("ignore"), because the waves are still too close together there to separate. This covers t = 0 to 0.018, the first 10 snapshots.
 
    The result is `jump_flags` [121, 511]. In every snapshot that is used you expect exactly **2 flags**, one at the contact and one at the shock.
-4. **Computes the exact solution.** From the case's left and right states it solves the Riemann problem exactly and averages the exact solution over each cell. The result is `U_exact` [121, 512, 3], in conservative variables, for **evaluation only**. It is never used for training.
+4. **Labels each cell with a class.** The class says where the cell's gas started and whether a shock has passed through it: **class = 2 × origin + shocked**, with origin 0 = left gas and 1 = right gas.
+
+   | Class | Name | In Sod |
+   |---|---|---|
+   | 0 | `left` | left state, fan and star-left |
+   | 1 | `left_shocked` | never occurs (no left-moving shock) |
+   | 2 | `right` | right state |
+   | 3 | `right_shocked` | star-right, between the contact and the shock |
+
+   - **Origin** comes from the entropy s = ln(p / ρ^γ). Gas keeps its entropy as it moves, except through a shock, where it rises. Each origin has an initial level, s_L and s_R, computed from the case's `left` and `right` states. A cell's origin is the highest level with s_q ≤ s_cell + 0.02.
+   - **Shocked** means s_cell exceeds that level by more than 0.02, **or** the cell's pressure is more than 2% above its gas's initial pressure. The pressure test is needed because a weak shock barely raises the entropy: by 0.0005 at r = 2, far below any usable tolerance. In a Riemann problem, only a shock compresses gas, so a pressure rise means a shock.
+   - **−1 (ignore)** marks the cells where the answer is unclear: a cell within 0.02 of two levels or below every level, a cell within 3 cells of a flagged face, or any cell on a snapshot with t < 0.02 (the same snapshots the flags ignore). The margin matters at the contact, where the solver smears s smoothly from s_L to s_R; without it, those cells would read as "left gas, shocked".
+
+   The result is `classes` [121, 512]. On every used snapshot you expect classes 0, 2 and 3, never 1, with about 2% of the cells set to −1 (the 6 margin cells around each of the 2 fronts).
+5. **Computes the exact solution.** From the case's left and right states it solves the Riemann problem exactly and averages the exact solution over each cell. The result is `U_exact` [121, 512, 3], in conservative variables, for **evaluation only**. It is never used for training.
 
 The grid, the splits and every attribute are copied from the raw file unchanged.
 
 **What is dropped:** all the in-between solver steps, `t_steps`, `store_idx` and the conservative FV fields. If you need any of them, they are still in the raw file.
 
-**The check it prints.** For each case it prints the fewest and most flags on any used snapshot (expect 2 and 2), and the largest distance, in cells, between a flagged face and the exact contact or shock. On r = 2, 10, 13 and 16 every snapshot has exactly 2 flags, all within 0.72 cells of the exact front.
+**The check it prints.** For each case it prints:
+- the fewest and most flags on any used snapshot (expect 2 and 2);
+- the largest distance, in cells, between a flagged face and the exact contact or shock;
+- the sets of classes that appear on the used snapshots (expect only `[0, 2, 3]`);
+- the fraction of cells set to −1 on the used snapshots (expect below 0.03).
+
+On r = 2, 10, 13 and 16, every snapshot has exactly 2 flags, all within 0.72 cells of the exact front. Every snapshot has classes {0, 2, 3}, and 2.3% of cells are −1. The classes match the exact solution on 100% of the labelled cells.
 
 ---
 
@@ -72,7 +93,7 @@ One HDF5 file, `preprocessing/data/step1_sod_pr.h5`, about 0.16 MB per case.
 | `/splits/test_id` | [16] | int | test, r inside the training range [2, 10] |
 | `/splits/test_ood` | [16] | int | test, r outside it, (10, 16] |
 
-File attributes: everything from the raw file (γ, x0, grid sizes, scheme, the generation YAML as `config_yaml`, …), plus `raw_file` (the input path), `T_train` = 0.16 and `preprocessing_config` (the preprocessing YAML used, as text).
+File attributes: everything from the raw file (γ, x0, grid sizes, scheme, the generation YAML as `config_yaml`, …), plus `raw_file` (the input path), `T_train` = 0.16, `preprocessing_config` (the preprocessing YAML used, as text) and `class_table` = `['left', 'left_shocked', 'right', 'right_shocked']` (the name of each class id, so K = 4).
 
 ### Per case: `/cases/000` … `/cases/103`
 
@@ -80,6 +101,7 @@ File attributes: everything from the raw file (γ, x0, grid sizes, scheme, the g
 |---|---|---|---|---|
 | `W_fv` | [121, 512, 3] | float32 | FV solution, (ρ, v, p) cell averages | field target |
 | `jump_flags` | [121, 511] | int8 | per face: 1 = jump, 0 = no jump, −1 = ignore | geometry target |
+| `classes` | [121, 512] | int8 | per cell: class 0 to 3 (see `class_table`), −1 = ignore | geometry target (cross-entropy) |
 | `U_exact` | [121, 512, 3] | float32 | exact solution, (ρ, ρv, E) cell averages | evaluation only |
 
 Attributes: `r` (pressure ratio, the encoder's input), `mu` = log r, `left` and `right` (the initial (ρ, v, p) states), `split`, `dt_solver` and `cfl_actual`.
@@ -111,6 +133,7 @@ case  = f['cases/000']
 r     = case.attrs['r']                      # float
 W     = case['W_fv'][()]                     # [121, 512, 3]  rho, v, p
 flags = case['jump_flags'][()]               # [121, 511]     1 / 0 / -1
+classes = case['classes'][()]                # [121, 512]     0..3 / -1
 rho, v, p = W[..., 0], W[..., 1], W[..., 2]  # each [121, 512]
 
 # shock and contact positions at t = 0.1

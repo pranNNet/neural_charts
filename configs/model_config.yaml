@@ -1,6 +1,6 @@
 # Model Parameters
 # Read by ----- / ----- / Sod_Shock_Tube_Validation.py (all take --config).
-name: test_model_1
+name: test_model_1D
 architecture:
   ablation:
     geometry: levelset  # levelset | none
@@ -8,11 +8,15 @@ architecture:
     fourier: "on"       # on | off
     head: softplus      # softplus | linear
   latent:
-    z_geo: 4
+    z_geo: 8            # ⚑ guess
     z_field: 32
-  coordinate_input: 2
+  coordinate_input: 1   # D: 1 for x, 2 for (x, y). t is not an input
 
 encoder:
+  type: cnn
+  N_grid: 512
+  conv_channels: [32, 64, 64, 64]   # ⚑ guess: 512 -> 32 cells
+  kernel: 5
   encodernet:
     input: 1
     hidden_layers: [64, 64, 64]
@@ -22,40 +26,41 @@ geometry:
   fourierfeatures:
     seed: 0
     bands:
-      - {n_freq: 16, sigma_x: 1.0, sigma_t: 0.5}
+      - {n_freq: 16, sigma_x: 1.0}
   geometrynet:
     hidden_layers: [128, 128, 128]
-    phi_output: 5
+    phi_output: 4         # K, from the class table
 
 field:
   eps: 0.004
-  # eps0: 0.1
-  # eps_min: 0.004
   fourierfeatures:
     seed: 1
     bands:
-      - {n_freq: 22, sigma_x: 1.0,  sigma_t: 0.5}
-      - {n_freq: 21, sigma_x: 3.0,  sigma_t: 1.0}
-      - {n_freq: 21, sigma_x: 10.0, sigma_t: 2.0}
+      - {n_freq: 22, sigma_x: 1.0}
+      - {n_freq: 21, sigma_x: 3.0}
+      - {n_freq: 21, sigma_x: 10.0}
   fieldnet:
-    regions: 5 #number of zones, also listed as K
+    regions: 4 #number of zones, also listed as K
     hidden_layers: [128, 128, 128, 128]
     field_output: 3
     N_dist: 4 #distance features per interface
     N_e: 8 # N_e-number ID for each zone k
+    n_bases: 16 # ⚑ guess: shared bases per output
     
 
 physics:
   constants:
     gamma: 1.4
   jump: 
-    Mn_floor: 0.5
-    beta: 50.0
+    Mn_gate: 1.05
+    speed_rel_tol: 0.01 # ⚑ interface_speed falls back to mean v.n below this relative density jump
+    width: 8   # cells, constraint at full strength out to here; must be >= side_offset. ⚑ guess
+    taper: 4   # cells, cosine taper to 0 after width. ⚑ guess
   fronts:
-    N_search: 512
-    search_chunk: null
-    k: 3.125 #L/(2*T_ref*u_ref)
-    tau_p: 0.05 #pressure-rise threshold for definingn a front as shock
+    tau_p: 0.10 #pressure-rise threshold for definingn a front as shock
+    side_offset: 4 # cells, plateau read distance from the front
+  time:
+    dt: 0.002
   scaling:
     rho_ref: 0.1
     u_ref: 1.0 #fill in with speed of sound

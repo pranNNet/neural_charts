@@ -229,3 +229,7 @@ data
 results
 logs
 diagnostics
+
+diag_animate.py
+diag_errors.py
+diag_fronts.py

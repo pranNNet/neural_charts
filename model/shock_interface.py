@@ -1,121 +1,137 @@
 import torch
 
+# ======================================================================================
+# RH map (shock physics only; any number of space dimensions)
+#   W = (rho, v_1..v_D, p): rho = W[:, 0], v = W[:, 1:-1], p = W[:, -1]
+# ======================================================================================
 
-def mn_effective(Mn: torch.Tensor, mn_floor=0.5, beta: float = 50.0) -> torch.Tensor:
-    """Smooth floor: Mn_e = m0 + softplus_beta(Mn - m0). mn_floor=None turns it off.
- 
-    Torch's softplus is exactly linear once beta*(Mn - m0) > 20, so with m0 = 0.5, beta = 50,
-    Mn_e == Mn bit for bit for Mn > 0.9: every physical shock is untouched.
-    """
-    if mn_floor is None:
-        return Mn
-    return mn_floor + torch.nn.functional.softplus(Mn - mn_floor, beta=beta)
- 
- 
-def Rankine_Hugoniot(W_minus: torch.Tensor, n: torch.Tensor, s: torch.Tensor,
-           gamma: float = 1.4, mn_floor=0.5, beta: float = 50.0):
-    """(W_minus [M, 3], n [M], s [M]) -> (W_plus [M, 3], Mn_raw [M]).
- 
-    Mn_raw is returned for the Lax certificate; the floored Mn_e is what the map uses.
-    """
-    rho_m, v_m, p_m = W_minus.unbind(-1)
+def normal_mach(W_up: torch.Tensor, n: torch.Tensor, s: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
+    """Mn [M] = (v_up . n - s) / c_up, in the shock frame. n [M, D] points upstream -> downstream,
+    s [M] is the normal speed along n, in field units."""
+    rho, v, p = W_up[:, 0], W_up[:, 1:-1], W_up[:, -1]
+    return ((v * n).sum(-1) - s) / torch.sqrt(gamma * p / rho)
+
+def rankine_hugoniot(W_up: torch.Tensor, n: torch.Tensor, s: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
+    """(W_up [M, 2+D], n [M, D], s [M]) -> W_RH [M, 2+D], the state just behind the shock.
+    Only call it where Mn > 1 (the shock test guarantees it). Only the normal velocity changes."""
+    rho_m, v_m, p_m = W_up[:, 0], W_up[:, 1:-1], W_up[:, -1]
     g = gamma
-    c_m = torch.sqrt(g * p_m / rho_m)
-    vn_m = v_m * n
-    Mn = (vn_m - s) / c_m                           # raw
-    M2 = mn_effective(Mn, mn_floor, beta) ** 2      # floored, used below
- 
+    M2 = normal_mach(W_up, n, s, gamma) ** 2
+    vn_m = (v_m * n).sum(-1)
+
     rho_p = rho_m * (g + 1) * M2 / ((g - 1) * M2 + 2)
     p_p = p_m * (1 + 2 * g / (g + 1) * (M2 - 1))
-    # Mass flux rho (v·n - s) is continuous: exact even when the floor is active.
+    # Mass flux rho (v.n - s) is continuous
     vn_p = s + (vn_m - s) * rho_m / rho_p
-    v_p = v_m + (vn_p - vn_m) * n                   # only the normal part changes (tangential kept, for 2D)
-    return torch.stack([rho_p, v_p, p_p], dim=-1), Mn
- 
- 
-def prim_to_cons(W: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
-    """(rho, v, p) -> (rho, m = rho v, E = p/(gamma-1) + rho v^2 / 2)."""
-    rho, v, p = W.unbind(-1)
-    return torch.stack([rho, rho * v, p / (gamma - 1) + 0.5 * rho * v * v], dim=-1)
- 
- 
-def euler_flux(W: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
-    """x-flux F(U) = (rho v, rho v^2 + p, v (E + p)), from primitives."""
-    rho, v, p = W.unbind(-1)
-    E = p / (gamma - 1) + 0.5 * rho * v * v
-    return torch.stack([rho * v, rho * v * v + p, v * (E + p)], dim=-1)
- 
- 
-def RH_residual(W_minus, W_plus, s, n, gamma: float = 1.4) -> torch.Tensor:
-    """[M]: ||F(U+) - F(U-) - S (U+ - U-)|| / ||F(U-)||, with lab-frame speed S = s·n."""
-    
-    S = (s * n).unsqueeze(-1)
-    dF = euler_flux(W_plus, gamma) - euler_flux(W_minus, gamma)
-    dU = prim_to_cons(W_plus, gamma) - prim_to_cons(W_minus, gamma)
-    num = torch.linalg.vector_norm(dF - S * dU, dim=-1)
-    return num / torch.linalg.vector_norm(euler_flux(W_minus, gamma), dim=-1)
- 
- 
-def lax_margin(Mn: torch.Tensor) -> torch.Tensor:
-    """Mn_raw - 1: > 0 for an admissible (compressive) shock."""
-    return Mn - 1
- 
- 
-def char_speeds(W: torch.Tensor, gamma: float = 1.4) -> torch.Tensor:
-    """[..., 3] lab-frame characteristic speeds (v - c, v, v + c)."""
-    rho, v, p = W.unbind(-1)
-    c = torch.sqrt(gamma * p / rho)
-    return torch.stack([v - c, v, v + c], dim=-1)
+    v_p = v_m + (vn_p - vn_m)[:, None] * n                 # tangential part kept (2D)
+    return torch.cat([rho_p[:, None], v_p, p_p[:, None]], dim=-1)
 
+def interface_speed(W_d, W_j, n, rel_tol: float = 0.01) -> torch.Tensor:
+    """s [M]: normal speed of the front along n (from d to j), field units, from the states on its two sides.
+    Mass conservation across the front: s = [rho v.n] / [rho]. Shock: the RH shock speed;
+    contact or material interface: v.n. Where |[rho]| < rel_tol * mean rho, s = mean v.n instead."""
+    rho_d, rho_j = W_d[:, 0], W_j[:, 0]
+    vn_d, vn_j = (W_d[:, 1:-1] * n).sum(-1), (W_j[:, 1:-1] * n).sum(-1)
+    d_rho = rho_j - rho_d
+    small = d_rho.abs() < rel_tol * 0.5 * (rho_d + rho_j)
+    s = (rho_j * vn_j - rho_d * vn_d) / torch.where(small, torch.ones_like(d_rho), d_rho)   # safe divide
+    return torch.where(small, 0.5 * (vn_d + vn_j), s)
 
+# ======================================================================================
+# Shock constraint
+# ======================================================================================
 
+def taper_weight(dist: torch.Tensor, width: float, taper: float) -> torch.Tensor:
+    """1 for dist <= width, cosine down to 0 over the next `taper`, 0 beyond."""
+    r = ((dist - width) / taper).clamp(0, 1)
+    return 0.5 * (1 + torch.cos(torch.pi * r))
 
+def constrain_shocks(W_regions, idx, d, j, frame, s, test_states, fields_at, cfg, apply: bool = True):
+    """Pinned RH constraint on the zone behind each shock and the contact condition on both sides of each contact,
+    decided per band point at t_n+1.
 
+    Band point i = idx[q] has own zone d[q] and neighbour zone j[q] across its nearest front, with the
+    advected frame frame[...][q] and normal front speed s[q] (field units, along n).
+      1. Read zone d's field at the pin point x_foot - side_offset*n (own side) and zone j's at
+         x_foot + side_offset*n (other side): both plateaus at t_n+1, not the smeared ramp.
+      2. Shock test (no gradient), on the input states at t_n, test_states = (W_in_d, W_in_j):
+         p_d > (1 + tau_p) p_j, compression (v_d - v_j).n_ud < 0, Mn > Mn_gate, and the downstream state
+         subsonic in the shock frame (Lax: Mn_d < 1). RH also needs the
+         predicted upstream state to be supersonic in the shock frame (Mn_pred > 1).
+      3. At shock points: W_RH = RH(W_up, n_ud, s_p), s_p the shock speed whose RH pressure is zone d's at the pin
+         (so RH sets rho and v behind from FieldNet's p, not from s), and zone d's field at the point is constrained
+         by the offset that makes it W_RH at the pin point, weighted by taper_weight(dist):
+             rho *= (rho_RH / rho_pin)^w,   v += (v_RH - v_pin) w,   p *= (p_RH / p_pin)^w
 
-
-
-def detect_shocks(W_a, W_b, n, s, gamma: float = 1.4, mn_floor=0.5, beta: float = 50.0,
-                  tau_p: float = 0.10, mn_gate: float = 1.05) -> dict:
-    """Classify each front as a shock or not, and give the RH state behind each shock.
- 
-    W_a, W_b [F, 3]: the fields of the zones left (a) and right (b) of each front, read at the
-    front point. n [F] points from a to b; s [F] is the normal speed along n, in field units
-    (both from find_fronts).
- 
-    Upstream is the low-pressure side. n_ud points upstream -> downstream, and s_ud is the normal
-    speed along n_ud. A front is a shock when p_down > (1 + tau_p) p_up and the flow compresses,
-    (v_down - v_up) * n_ud < 0. That is a discrete decision, with no gradient.
-+    [FIX 1] It must also pass the Lax test Mn_raw > mn_gate (shock frame, from W_up, n_ud, s_ud):
-+    a contact has Mn = 0 and a fan edge |Mn| = 1, so neither passes. mn_gate=None turns it off.
-    Sod check: shock between zone 3 (a, left) and 4 (b, right): upstream = b, n_ud = -1,
-    v_down - v_up = u* > 0, so the compression test holds.
- 
-    Returns [F] tensors: is_shock (bool), up_is_a (bool), n_ud, s_ud, W_up [F, 3], W_dn [F, 3],
-    W_RH [F, 3] and Mn_raw, Mn_eff [F]. The last three are NaN where is_shock is False:
-    the RH map is only evaluated at shocks.
+      4. At contact points (no shock, |[p]| <= tau_p max p on the input states): zone d's field is shifted so its
+         p and v.n at the pin equal the shared values (geometric mean p, mean v.n of both sides), same taper.
+    fields_at(u, rows) -> [len(u), K, F] zone fields at points u with the latents of rows.
+    cfg: gamma, tau_p, Mn_gate, side_offset, width, taper.
+    apply=False (free-jump arm) runs steps 1-3 for the hooks but returns W_regions unchanged.
+    Returns (W_regions, jump); jump holds per band point values (W_RH NaN and w 0 where not a shock).
     """
-    up_is_a = W_a[:, 2] <= W_b[:, 2]
-    W_up = torch.where(up_is_a[:, None], W_a, W_b)
-    W_dn = torch.where(up_is_a[:, None], W_b, W_a)
-    n_ud = torch.where(up_is_a, n, -n)
-    s_ud = torch.where(up_is_a, s, -s)
- 
+    P = len(idx)
+    q = torch.arange(P, device=idx.device)
+    n_ud, s_ud = -frame['n'], -s                           # upstream (j) -> downstream (d)
+
+    # 1. plateau reads on both sides of the front, at t_n+1
+    step = cfg['side_offset'] * frame['n']
+    u = torch.cat([frame['x_foot'] - step, frame['x_foot'] + step]).clamp(-1, 1)   # [2P, D]
+    W_side = fields_at(u, idx.repeat(2))                                       # [2P, K, F]
+    W_pin, W_up = W_side[:P][q, d], W_side[P:][q, j]                           # [P, F] each
+
+    # 2. shock test, on the input states at t_n
+    W_in_d, W_in_j = test_states
     with torch.no_grad():
-        is_shock = (W_dn[:, 2] > (1 + tau_p) * W_up[:, 2]) & ((W_dn[:, 1] - W_up[:, 1]) * n_ud < 0)
-        if mn_gate is not None:                                              # [FIX 1] Lax gate
-            Mn_all = (W_up[:, 1] * n_ud - s_ud) / torch.sqrt(gamma * W_up[:, 2] / W_up[:, 0])
-            is_shock &= Mn_all > mn_gate
- 
-    F = W_a.shape[0]
-    idx = torch.nonzero(is_shock).squeeze(1)
-    W_RH_s, Mn_s = Rankine_Hugoniot(W_up[idx], n_ud[idx], s_ud[idx], gamma, mn_floor, beta)
-    nan = float("nan")
-    W_RH = W_up.new_full((F, 3), nan).index_put((idx,), W_RH_s)
-    Mn_raw = W_up.new_full((F,), nan).index_put((idx,), Mn_s)
-    Mn_eff = W_up.new_full((F,), nan).index_put((idx,), mn_effective(Mn_s, mn_floor, beta))
- 
-    return {"is_shock": is_shock, "up_is_a": up_is_a, "n_ud": n_ud, "s_ud": s_ud,
-            "W_up": W_up, "W_dn": W_dn, "W_RH": W_RH, "Mn_raw": Mn_raw, "Mn_eff": Mn_eff}
+        Mn = normal_mach(W_in_j, n_ud, s_ud, cfg['gamma'])
+        shock = ((W_in_d[:, -1] > (1 + cfg['tau_p']) * W_in_j[:, -1])
+                 & (((W_in_d[:, 1:-1] - W_in_j[:, 1:-1]) * n_ud).sum(-1) < 0)
+                 & (Mn > cfg['Mn_gate'])
+                 & (normal_mach(W_in_d, n_ud, s_ud, cfg['gamma']) < 1)        # AUDIT fix: Lax, subsonic behind; drops a
+                 & (normal_mach(W_up, n_ud, s_ud, cfg['gamma']) > 1))          # wild s from a drifted rollout field. RH defined (p_RH > 0)
+        # AUDIT fix: contact test, the same input states: no shock and pressure continuous to within tau_p
+        contact = ~shock & ((W_in_d[:, -1] - W_in_j[:, -1]).abs() <= cfg['tau_p'] * torch.maximum(W_in_d[:, -1], W_in_j[:, -1]))
 
+    # 3. RH state and the constraint, at shock points only
+    sh = torch.nonzero(shock).squeeze(1)
+    # AUDIT fix: the shock strength comes from zone d's own pressure at the pin (FieldNet, trained on the data), not
+    # from s. s is read off the last step's output, i.e. off the RH band, and RH(s) gives back a state whose speed
+    # law is s again: a one-off bad s (foot a few cells off) was written into the band and never washed out
+    g, W_u = cfg['gamma'], W_up[sh]
+    Mn_p = torch.sqrt((1 + (g + 1) / (2 * g) * (W_pin[sh, -1] / W_u[:, -1] - 1)).clamp(min=1))   # Mn from p_d / p_up
+    s_p = (W_u[:, 1:-1] * n_ud[sh]).sum(-1) - Mn_p * torch.sqrt(g * W_u[:, -1] / W_u[:, 0])
+    W_RH = rankine_hugoniot(W_u, n_ud[sh], s_p, g)                                 # [S, F], p_RH = p_pin
+    w = taper_weight(frame['dist'][sh], cfg['width'], cfg['taper'])             # [S]
 
+    # 4. AUDIT fix: contact condition. No mass crosses a contact, so p and v.n are continuous ([p] = [v.n] = 0; rho and
+    # tangential v are free). Each side's field is shifted to the shared values at its pin (mean v.n, geometric mean
+    # p of the two zone fields at their pins), with the same taper. Both sides are band points, so both move; the
+    # shared values come from the fields at t_n+1, not from the last step's output, so there is no loop
+    ct = torch.nonzero(contact).squeeze(1)
+    n_c, W_c, W_o = frame['n'][ct], W_pin[ct], W_up[ct]
+    w_c = taper_weight(frame['dist'][ct], cfg['width'], cfg['taper'])
 
+    corr = W_regions.new_zeros(W_regions.shape)                                 # (log rho, v, log p) per point, zone d
+    if apply and len(sh) > 0:
+        W_p = W_pin[sh]
+        delta = torch.cat([torch.log(W_RH[:, :1] / W_p[:, :1]),
+                           W_RH[:, 1:-1] - W_p[:, 1:-1],
+                           torch.log(W_RH[:, -1:] / W_p[:, -1:])], dim=-1)
+        corr = corr.index_put((idx[sh], d[sh]), delta * w[:, None])
+    if apply and len(ct) > 0:
+        dvn = 0.5 * ((W_o[:, 1:-1] - W_c[:, 1:-1]) * n_c).sum(-1)
+        delta = torch.cat([torch.zeros_like(W_c[:, :1]),
+                           dvn[:, None] * n_c,
+                           0.5 * torch.log(W_o[:, -1:] / W_c[:, -1:])], dim=-1)
+        corr = corr.index_put((idx[ct], d[ct]), delta * w_c[:, None])
+    if apply and len(sh) + len(ct) > 0:
+        W_regions = torch.cat([W_regions[..., :1] * torch.exp(corr[..., :1]),
+                               W_regions[..., 1:-1] + corr[..., 1:-1],
+                               W_regions[..., -1:] * torch.exp(corr[..., -1:])], dim=-1)
+
+    jump = {'idx': idx, 'zone': d, 'neighbour': j,
+            'dist': frame['dist'], 'n': frame['n'], 's': s, 'x_foot': frame['x_foot'],
+            'shock': shock, 'contact': contact, 'Mn': Mn, 'W_up': W_up, 'W_pin': W_pin,
+            'W_RH': W_up.new_full(W_up.shape, float('nan')).index_put((sh,), W_RH),
+            'w': w.new_zeros(P).index_put((sh,), w)}
+    return W_regions, jump

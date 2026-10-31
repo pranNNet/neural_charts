@@ -7,8 +7,11 @@ architecture:
     jump_mode: RH       # RH | free
     fourier: "on"       # on | off
 
+data:                   # NEW
+  t0: 0.02              # rollout start, after the waves separate
+
 split:
-  train: 
+  train:
     batch_size: 64
   validate:
     batch_size: 80
@@ -20,6 +23,7 @@ geometry:
   warmup_steps: 2000
   eps0: 0.1
   eps_min: 0.004
+  lambda_ce: 1.0        # NEW ⚑ class CE weight at t_n
 
 field:
   epochs: 750
@@ -33,10 +37,19 @@ finetune:
   field_lr: 1.0e-4
   lr_min: 1.0e-6
   eps: 0.004
+  lambda_ce: 0.1        # NEW ⚑ weight on CE at n + CE at n+1
+
+rollout:                # NEW, stage 4
+  R: [2, 4, 8]
+  epochs_per_R: 140     # ⚑ about 10k steps per R at 70 steps/epoch
+  lr: 3.0e-4            # ⚑
+  lr_min: 1.0e-6
+  detach: false         # true cuts the graph every other step if memory runs out
 
 misc:
   lambdaZ: 1.0e-5
   grad_clip: 1.0
+  noise_std: 0.01       # NEW ⚑ input noise in stages 2-3, as a fraction of each variable's std
 
 path:
   data_path: ./data/step1_sod_pr.h5

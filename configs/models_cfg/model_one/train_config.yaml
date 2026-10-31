@@ -7,36 +7,57 @@ architecture:
     jump_mode: RH       # RH | free
     fourier: "on"       # on | off
 
+data:
+  t0: 0.02              # rollout start, after the waves separate
+
 split:
-  train: 
-    batch_size: 64
+  train:
+    batch_size: 128
   validate:
     batch_size: 80
 
 geometry:
   epochs: 500
-  lr: 1.0e-2
+  lr: 1.0e-3            # AUDIT 8 ⚑ was 1e-2; plan §7.4 has 1e-3. Keep it if the stage 1 loss stays smooth
   lr_min: 1.0e-5
   warmup_steps: 2000
-  eps0: 0.1
-  eps_min: 0.004
+                        # AUDIT 5: eps0 and eps_min removed (no eps in the losses)
+  lambda_ce: 1.0        # ⚑ class CE weight at t_n
 
 field:
   epochs: 750
   lr: 5.0e-3
   lr_min: 1.0e-5
   warmup_steps: 2000
+  encoder: all          # AUDIT fix: the whole encoder learns the plateaus (head only left a per-step bias)
+
+geometry_refit:         # AUDIT fix: stage 1 again after stage 2, trunk frozen, to follow the moved z_geo
+  epochs: 100           # ⚑
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  warmup_steps: 500
+  lambda_ce: 1.0
+  encoder: geo_head
 
 finetune:
   epochs: 300
   geo_lr: 1.0e-4
   field_lr: 1.0e-4
   lr_min: 1.0e-6
-  eps: 0.004
+  lambda_ce: 0.1        # ⚑ weight on CE at n + CE at n+1
+
+rollout:                # stage 4
+  R: [2, 4]             # AUDIT: R = 8 runs out of memory
+  epochs_per_R: 140     # ⚑ about 10k steps per R at 70 steps/epoch
+  lr: 1.0e-4            # AUDIT ⚑ was 3e-4, 3x stage 3's lr with no warmup on a converged model
+  lr_min: 1.0e-6
+  detach: false         # true cuts the graph between steps: no gradient through the model's own input
+  lambda_ce: 0.1        # AUDIT fix ⚑ CE at n and n+1 per step, as in stage 3; without it the fronts drift
 
 misc:
   lambdaZ: 1.0e-5
   grad_clip: 1.0
+  noise_std: 0.01       # ⚑ input noise in stages 2-3, as a fraction of each variable's std
 
 path:
   data_path: ./data/step1_sod_pr.h5

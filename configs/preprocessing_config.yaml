@@ -15,3 +15,8 @@ jump_flags:               # face tests on normalized jumps (jump_flags.py); thre
   tau_v: 0.005            # ... with compression g_v < -tau_v
   tau_c: 0.02             # contact: density jump g_rho > tau_c ...
   tau_c_p: 0.005          # ... at nearly constant pressure g_p < tau_c_p
+
+classes:                  # entropy classes (classes.py); uses the jump_flags t_min; values are guesses to tune
+  tol: 0.02               # entropy tolerance: within tol of a level = gas from it; above it by more = shocked
+  tol_p: 0.02             # also shocked: p > (1 + tol_p) * the gas's initial p (weak shocks barely raise entropy)
+  flag_margin: 3          # cells within this many cells of a flagged face are -1 (smeared contact or shock)
