@@ -99,6 +99,7 @@ class FieldNet(nn.Module):
         a = self.coeff(build_cond(z_field, e)).view(N, e.shape[0], self.N_bases, self.N_out)  # [N, K, M, F]
         return torch.einsum('nkmf,nmf->nkf', a, b)                         # [N, K, F]
 
+
 def positive_clamp(R):
 
     # R = (rho, v_1..v_D, p): softplus on rho and p, velocity left free

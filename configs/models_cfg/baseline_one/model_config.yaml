@@ -39,7 +39,7 @@ field:                    # AUDIT 5: unused eps removed; the blend width is fine
       - {n_freq: 21, sigma_x: 10.0}
   fieldnet:
     regions: 4 #number of zones, also listed as K
-    hidden_layers: [149, 149, 149, 149]
+    hidden_layers: [128, 128, 128, 128]
     field_output: 3
     # AUDIT 7: N_dist removed (always zeros)
     N_e: 8 # N_e-number ID for each zone k

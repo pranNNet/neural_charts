@@ -8,7 +8,7 @@ architecture:
     fourier: "on"       # on | off
     head: softplus      # softplus | linear
   latent:
-    z_geo: 8            # ⚑ guess
+    z_geo: 0            # LOCAL GEOMETRY: no geometry latent (the baseline keeps 8, it feeds FieldNet there)
     z_field: 32
   coordinate_input: 1   # D: 1 for x, 2 for (x, y). t is not an input
 
@@ -22,10 +22,10 @@ encoder:
     hidden_layers: [64, 64, 64]
 
 geometry:                 # AUDIT 3: norm_delta removed (no phi_hat normalization)
-  fourierfeatures:
-    seed: 0
-    bands:
-      - {n_freq: 16, sigma_x: 1.0}
+  features:               # LOCAL GEOMETRY: Conv1d stack on W(t_n), stride 1, replicate padding; replaces Fourier(x~) + z_geo
+    conv_channels: [64, 64, 64]   # ⚑ guess; plus a last linear conv into N_feat, so 4 layers
+    N_feat: 32            # ⚑ guess
+    kernel: 5             # 4 layers x (kernel // 2) = +-8 cells receptive field
   geometrynet:
     hidden_layers: [128, 128, 128]
     phi_output: 4         # K, from the class table

@@ -1,10 +1,8 @@
 import torch
 
-
 # ======================================================================================
 # Multi-Scale Fourier Transform
 # ======================================================================================
-
 
 def MSFourier_Features(x: torch.Tensor, B:torch.Tensor) -> torch.Tensor:
     """[N, D] normalized space -> [N, D + 2*n_freq]: [x, sin(2pi x@B), cos(2pi x@B)].    # AUDIT: docstring

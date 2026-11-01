@@ -46,15 +46,16 @@ def front_loss(out, classes, flags):                                            
     return sum(class_ce(phi, classes[:, i]) + boundary_loss(phi, flags[:, i])[0]
                for i, phi in enumerate((out['phi_hat_now'], out['phi_hat'])))
 
-def geometry_loss(model, encoder, batch, x_cell, lambda_ce):                     # AUDIT 5: no eps
-    '''Stage 1: lambda_ce * CE on the classes + boundary loss on the flags, both at t_n.'''
-    z_geo, z_field = encoder(batch['W_in'].transpose(1, 2))
-    x, group = points(x_cell, len(z_geo))
-    phi = model.geometry(x, z_geo[group])
+def geometry_loss(model, batch, x_cell, lambda_ce):                              # AUDIT 5: no eps
+    '''Stage 1: lambda_ce * CE on the classes + boundary loss on the flags, both at t_n.
+    LOCAL GEOMETRY: no encoder; the geometry reads W^n through LevelSetsNet's conv features.'''
+    W_grid = batch['W_in'].transpose(1, 2)                                     # [B, 3, 512]
+    x, group = points(x_cell, len(W_grid))
+    phi = model.geometry(x, W_grid, group)
 
     ce = class_ce(phi, batch['classes'][:, 0])
     bnd, smooth, jump = boundary_loss(phi, batch['flags'][:, 0])
-    return lambda_ce * ce + bnd, ce, smooth, jump, z_geo, z_field
+    return lambda_ce * ce + bnd, ce, smooth, jump
 
 def cell_L1(model, W_in, W_target, x_cell, z_geo, z_field):                     # AUDIT fix: no blend / eps
     '''one step W_in [B, 512, 3] -> t_{n+1}, L1 against W_target. Also returns the output.'''
@@ -92,7 +93,6 @@ def val_L1(model, encoder, val_loader, x_cell):
         out.append(rollout_L1(model, encoder, batch, x_cell)[0].item())
     return np.mean(out)
 
-
 # ======================================================================================
 # One-region support
 # ======================================================================================
@@ -102,7 +102,8 @@ def geo_net(model):
     return model.LevelSetsNet if model.geo_mode == 'levelset' else None
 
 def set_encoder_trainable(encoder, which):
-    '''which: 'none', 'head' (z_field head only), 'geo_head' (z_geo head only) or 'all'. Returns the trainable encoder params.'''
+    '''which: 'none', 'head' (z_field head only), 'geo_head' (z_geo head only; unused with the local geometry)
+    or 'all'. Returns the trainable encoder params.'''
     encoder.requires_grad_(which == 'all')
     if which == 'head':
         encoder.mlp.head_field.requires_grad_(True)     # FieldEncoder keeps its heads in .mlp

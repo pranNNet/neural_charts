@@ -55,7 +55,7 @@ rollout:                # stage 4
   lambda_ce: 0.1        # AUDIT fix ⚑ CE at n and n+1 per step, as in stage 3; without it the fronts drift
 
 misc:
-  lambdaZ: 0
+  lambdaZ: 0.0           # was 1e-5; with the CNN encoder its only effect was shrinking a latent no loss reaches (z_geo in stage 2)
   grad_clip: 1.0
   noise_std: 0.01       # ⚑ input noise in stages 2-3, as a fraction of each variable's std
 

@@ -7,32 +7,56 @@ import torch.nn as nn
 
 class LevelSetsNet(nn.Module):
     '''
-    Predicts Level-Sets parameters and region splits
-        - input
-            - (x, t) input (or fourier features)
-
-        - z[x: ] -> RegionFieldNet
+    Local level sets: raw zone scores phi(u) from the input field near u.         # LOCAL GEOMETRY
+        - features: W_grid [B, C, N] -> standardize -> Conv1d stack (stride 1, replicate padding,
+          no coordinate channel) -> feat_grid [B, N_feat, N]. Cell i sees i +- n_layers * (kernel // 2) cells.
+        - net: INR MLP on f(u) [P, N_feat], the features read at u (sample_grid in neural_chart.py) -> phi [P, K].
+    No x~, no Fourier features, no z_geo: the same weights at every x, so phi depends only on W near u.
     '''
 
-    def __init__(self, N_in, z_geo, N_out,
-                 hidden_layers = [128, 128, 128, 128],
+    def __init__(self, N_channels, N_out,
+                 conv_channels = [64, 64, 64], N_feat = 32, kernel = 5,
+                 hidden_layers = [128, 128, 128],
                  act = nn.SiLU):
-        
+
         super().__init__()
 
-        dims = [N_in + z_geo] + hidden_layers + [N_out]
+        # set once from the training data (as FieldEncoder's); saved with the checkpoint
+        self.register_buffer("w_mean", torch.zeros(N_channels, 1))
+        self.register_buffer("w_std", torch.ones(N_channels, 1))
 
+        # conv stack: len(conv_channels) + 1 layers, the last one linear into the feature channels
+        dims = [N_channels] + conv_channels + [N_feat]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Conv1d(dims[i], dims[i+1], kernel, stride = 1,
+                                    padding = kernel // 2, padding_mode = 'replicate'))
+            if i < len(dims) - 2:
+                layers.append(act())
+        self.features = nn.Sequential(*layers)
+
+        # INR head on the local features
+        dims = [N_feat] + hidden_layers + [N_out]
         layers = []
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i+1]))
-
             if i < len(dims) - 2:
                 layers.append(act())
-
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x, z_geo):
-        return self.net(torch.cat((x, z_geo),dim=-1).to(torch.float32))
+        # ⚑ He init, zero bias, as in FieldEncoder (default init shrinks input differences layer by layer)
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity = 'relu')
+                nn.init.zeros_(m.bias)
+
+    def feat_grid(self, W_grid):
+        """W_grid [B, C, N] primitives -> feat_grid [B, N_feat, N]. Once per step."""
+        return self.features((W_grid.to(torch.float32) - self.w_mean) / self.w_std)
+
+    def forward(self, f):
+        """f [P, N_feat] features read at the query points -> phi [P, K]."""
+        return self.net(f)
 
 
 # ======================================================================================

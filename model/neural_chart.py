@@ -48,24 +48,24 @@ class NeuralChart1DST(nn.Module):
         # Key diff is Level-set or Not
         if self.geo_mode == "levelset":
 
-            #bands for multi-scale fourier features
-            self.B_geo = build_B(bands = geo_cfg['fourierfeatures']['bands'],
-                                 seed = geo_cfg['fourierfeatures']['seed'],
-                                 fourier=self.fourier,
-                                 N_input = N_input
-                                 )
-
+            # LOCAL GEOMETRY: no B_geo (no Fourier features on x~ for the geometry)
             self.B_field = build_B(bands = field_cfg['fourierfeatures']['bands'],
                                    seed = field_cfg['fourierfeatures']['seed'],
                                    fourier=self.fourier,
                                    N_input = N_input
                                    )
 
-            self.LevelSetsNet = LevelSetsNet(N_in = N_input + 2*self.B_geo.shape[1],
-                                            z_geo = config['architecture']['latent']['z_geo'],
+            assert N_input == 1, "local geometry: sample_grid and the Conv1d features are 1D"
+            assert config['architecture']['latent']['z_geo'] == 0, "local geometry: set latent.z_geo: 0"
+            feat_cfg = geo_cfg['features']
+            self.LevelSetsNet = LevelSetsNet(N_channels = field_cfg['fieldnet']['field_output'],
                                             N_out = geo_cfg['geometrynet']['phi_output'],
+                                            conv_channels = feat_cfg['conv_channels'],
+                                            N_feat = feat_cfg['N_feat'],
+                                            kernel = feat_cfg['kernel'],
                                             hidden_layers = geo_cfg['geometrynet']['hidden_layers']
                                             )
+            self.feat_grid = None        # [B, N_feat, N_grid], set by forward / geometry once per step
 
             self.FieldNet = FieldNet(N_in = N_input + 2*self.B_field.shape[1],
                                      N_regions = field_cfg['fieldnet']['regions'],
@@ -95,7 +95,7 @@ class NeuralChart1DST(nn.Module):
             # Baseline comparison (no Level Set Functionality)
 
             #bands for multi-scale fourier features
-            self.B_geo, self.LevelSetsNet = None, None
+            self.LevelSetsNet = None
 
             self.B_field = build_B(bands = field_cfg['fourierfeatures']['bands'],
                                    seed = field_cfg['fourierfeatures']['seed'],
@@ -112,22 +112,33 @@ class NeuralChart1DST(nn.Module):
                                      N_bases = field_cfg['fieldnet']['n_bases']
                                      )
 
-    def geo_phi(self, u, z):
-        """u [P, D] normalized space, z [P, z_geo] -> phi [P, K]. Same call as in forward."""
-        return self.LevelSetsNet(MSFourier_Features(u, self.B_geo), z)
+    def set_features(self, W_grid):
+        """LOCAL GEOMETRY: the conv features of the input field, once per step. Every geo_phi call reads them."""
+        self.feat_grid = self.LevelSetsNet.feat_grid(W_grid)
+        return self.feat_grid
+
+    def geo_phi(self, u, rows):
+        """u [P, D] normalized space, rows [P] or [P, 1] each point's row in W_grid -> phi [P, K].
+        phi = LevelSetsNet(f(u)), f the features at u, linear between cell centres: the gradient in u
+        (Newton normals) flows through the interpolation. Needs set_features first. Same call as in forward;
+        front_distances passes rows as [P, 1] in place of the old z."""
+        rows = rows.reshape(-1).long()
+        return self.LevelSetsNet(sample_grid(self.feat_grid, rows, u))
 
     def heads_fn(self, h):
         """S.6, switched by `heads`. linear: rho = h1, p = h3 (positivity ablation, §6)."""
         return positive_clamp(h) if self.head == "softplus" else h
 
-    def geometry(self, x, z_geo):
-        """GEOMETRY at t_n: raw scores phi [N, K], detached unless the geometry trains. Used alone in stage 1.
+    def geometry(self, x, W_grid, group):
+        """GEOMETRY at t_n: raw scores phi [N, K] from the input field W_grid [B, C, N_grid] (group [N] each
+        point's row), detached unless the geometry trains. Used alone in stage 1 (sets the features).
         The owner of a point is phi.argmax(-1); phi is not a distance (front_frame gives those)."""
         train_geo = torch.is_grad_enabled() and any(p.requires_grad for p in self.LevelSetsNet.parameters())
-        phi = self.geo_phi(x, z_geo)                                       # AUDIT 3: plain forward
+        self.set_features(W_grid)
+        phi = self.geo_phi(x, group)                                       # AUDIT 3: plain forward
         return phi if train_geo else phi.detach()
 
-    def jump_step(self, x, rows, z_geo, z_field, phi, W_regions, W_grid, train_geo):
+    def jump_step(self, x, rows, z_field, phi, W_regions, W_grid, train_geo):
         """JUMP module. Band points get their front frame at t_n, the front speed from the input field,
         then advection to t_n+1 and the shock constraint there. 'free' runs it for the hooks but
         changes nothing. Returns (W_regions, jump, phi_next)."""
@@ -138,11 +149,11 @@ class NeuralChart1DST(nn.Module):
         # AUDIT 1 fix: j is the zone across the nearest front that is there (label check built in), chosen
         # by distance. The score rank says nothing about which zone is adjacent. Band points at t_n: a front
         # moves at most reach per step (advect), so dist <= 2 * reach can end within reach at t_n+1
-        near, zones = front_distances(self.geo_phi, x, z_geo, d, cfg['side_offset']).topk(2, dim=-1, largest=False)
+        near, zones = front_distances(self.geo_phi, x, rows[:, None], d, cfg['side_offset']).topk(2, dim=-1, largest=False)
         j = zones[:, 0]
         idx = torch.nonzero(near[:, 0] <= 2 * reach).squeeze(1)
-        z_band = z_geo[idx]
-        frame = front_frame(lambda u: self.geo_phi(u, z_band), x[idx], d[idx], j[idx], train_geo)
+        rows_band = rows[idx]                                  # LOCAL GEOMETRY: rows in place of z_geo
+        frame = front_frame(lambda u: self.geo_phi(u, rows_band), x[idx], d[idx], j[idx], train_geo)
 
         # time-n reads at the pin (own side) and the other side
         P = len(idx)
@@ -178,7 +189,8 @@ class NeuralChart1DST(nn.Module):
         '''
         INPUT REQUIREMENTS
         - x [N, D] normalized cell centres (space only), where W at t_n+1 is predicted
-        - z_geo and z_field [N, .] per point, from the encoder of the input step
+        - z_geo and z_field [N, .] per point, from the encoder of the input step. LOCAL GEOMETRY: the level-set
+          arms ignore z_geo (latent.z_geo: 0); the geometry reads W_grid through LevelSetsNet's conv features
         - W_grid [B, C, N_grid] the input field at t_n (primitives); group [N] each point's row in W_grid
 
         OUTPUT DESCRIPTION (all at t_n+1 unless marked):
@@ -210,14 +222,14 @@ class NeuralChart1DST(nn.Module):
         # for the LEVELSET MODEL
 
         #forward GEOMETRY module, at t_n
-        phi_now = self.geometry(x, z_geo)
+        phi_now = self.geometry(x, W_grid, group)
         train_geo = phi_now.requires_grad
 
         #forward FIELD module, at t_n+1
         W_regions = self.heads_fn(self.FieldNet(MSFourier_Features(x, self.B_field), z_field))     # AUDIT 7
 
         #forward JUMP module: front speed, advection to t_n+1, pinned RH constraint behind shocks
-        W_regions, jump, phi = self.jump_step(x, group, z_geo, z_field, phi_now,
+        W_regions, jump, phi = self.jump_step(x, group, z_field, phi_now,
                                               W_regions, W_grid, train_geo)
 
         #BLEND (assembly), hard, with the advected scores. AUDIT fix: the soft blend is gone; trained against a
@@ -233,4 +245,3 @@ class NeuralChart1DST(nn.Module):
                 'phi_hat_now': phi_now,
                 'weights': weights,
                 'jump': jump}
-    

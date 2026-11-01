@@ -2,8 +2,6 @@ from pathlib import Path
 import os
 import yaml
 import numpy as np
-import multiprocessing
-
 
 import torch
 import torch.nn as nn
@@ -17,7 +15,10 @@ from train.dataset import load_splits, RolloutDataset
 from train.helper import geometry_loss, cell_L1, front_loss, rollout_L1, val_L1
 from train.helper import z_penalty, geo_net, set_encoder_trainable
 
+
 torch.backends.cuda.matmul.allow_tf32 = True
+
+
 
 # ======================================================================================
 # Stage 1: geometry (segmentation of W^n)
@@ -28,16 +29,18 @@ def train_geometry(model, encoder,
                    x_cell, writer,
                    config = Path(__file__).parent.parent / 'configs' / 'train_config.yaml',
                    checkpoint_dir = Path(__file__).parent.parent / 'results' / 'stage1.pt',
-                   tag = 'stage1'):                 # tensorboard prefix: 'refit' for the geometry refit
+                   tag = 'stage1'):                 # tensorboard prefix
 
     os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
 
-    # enable training on LevelSetNet only
+    # enable training on LevelSetsNet only (conv features + INR head). LOCAL GEOMETRY: the encoder is not used
+    # in stage 1 (nothing in the geometry reads it); it is passed only to keep it in the checkpoints
     model.requires_grad_(False)
     model.LevelSetsNet.requires_grad_(True)
+    encoder.requires_grad_(False)
 
     # set up training components
-    params = list(model.LevelSetsNet.parameters()) + set_encoder_trainable(encoder, config['geometry'].get('encoder', 'all'))
+    params = list(model.LevelSetsNet.parameters())
     optimizer = torch.optim.Adam(params, lr=config['geometry']['lr'])
 
     step_tot = config['geometry']['epochs'] * len(train_loader)
@@ -60,17 +63,18 @@ def train_geometry(model, encoder,
         for batch in train_loader:
             batch = {key: val.to(x_cell.device) for key, val in batch.items()}
 
-            # encoder(W^n) and CE + boundary loss at t_n, in one call. AUDIT 5: no eps schedule
-            loss, ce, smooth, jump, z_geo, z_field = geometry_loss(model, encoder, batch, x_cell, lambda_ce)
+            # CE + boundary loss at t_n from W^n, in one call. AUDIT 5: no eps schedule. LOCAL GEOMETRY: no latent
+            loss, ce, smooth, jump = geometry_loss(model, batch, x_cell, lambda_ce)
 
             optimizer.zero_grad(set_to_none=True)
-            (loss + config['misc']['lambdaZ'] * z_penalty(z_geo, z_field)).backward()
+            loss.backward()
 
-            nets = {'geo': model.LevelSetsNet, 'field': model.FieldNet, 'enc': encoder}
+            nets = {'geo_conv': model.LevelSetsNet.features, 'geo_inr': model.LevelSetsNet.net}
             for name, net in nets.items():
                 g = [p.grad for p in net.parameters() if p.grad is not None]
                 if g:   # frozen nets have no grads, skip them
                     writer.add_scalar(f'{tag}/grad_norm/{name}', torch.linalg.vector_norm(torch.stack([x.norm() for x in g])).item(), step)
+
 
             torch.nn.utils.clip_grad_norm_(params, config['misc']['grad_clip'])
             optimizer.step()
@@ -78,11 +82,10 @@ def train_geometry(model, encoder,
 
             writer.add_scalar(f'{tag}/train_loss', loss.item(), step)
             writer.add_scalar(f'{tag}/schedule/lr', scheduler.get_last_lr()[0], step)
-            writer.add_scalar(f'{tag}/latent/z_geo norm', z_geo.norm(dim=-1).mean(), step)
-            writer.add_scalar(f'{tag}/latent/z_field norm', z_field.norm(dim=-1).mean(), step)
             writer.add_scalar(f'{tag}/loss/class ce', ce, step)
             writer.add_scalar(f'{tag}/loss/jump loss', jump, step)
             writer.add_scalar(f'{tag}/loss/smooth loss', smooth, step)
+
 
             step += 1
             tot_loss += loss.item()
@@ -96,7 +99,7 @@ def train_geometry(model, encoder,
             with torch.no_grad():
                 for batch in val_loader:
                     batch = {key: val.to(x_cell.device) for key, val in batch.items()}
-                    vals.append(geometry_loss(model, encoder, batch, x_cell, lambda_ce)[0].item())   # AUDIT 5
+                    vals.append(geometry_loss(model, batch, x_cell, lambda_ce)[0].item())   # AUDIT 5
 
                 val = np.mean(vals)
                 writer.add_scalar(f'{tag}/val_loss', val, step)
@@ -104,6 +107,7 @@ def train_geometry(model, encoder,
                     best = val
                     torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
                                 checkpoint_dir)
+
 
                 print(f"loss: {val:>7f}")
 
@@ -113,6 +117,7 @@ def train_geometry(model, encoder,
     state = torch.load(checkpoint_dir)
     model.load_state_dict(state['model'])
     encoder.load_state_dict(state['encoder'])
+
 
 # ======================================================================================
 # Stage 2: field (one step, hard blend)
@@ -165,6 +170,7 @@ def train_field(model, encoder,
             optimizer.zero_grad(set_to_none=True)
             (loss + config['misc']['lambdaZ'] * z_penalty(z_geo, z_field)).backward()
 
+
             nets = {'geo': geo_net(model), 'field': model.FieldNet, 'enc': encoder}
             for name, net in nets.items():
                 if net is None:              # one-region baseline has no geometry net
@@ -184,6 +190,7 @@ def train_field(model, encoder,
 
             step += 1
             tot_loss += loss.item()
+
 
         print('TRAIN:')
         print(f"loss: {tot_loss / len(train_loader):>7f}")
@@ -261,6 +268,7 @@ def finetune(model, encoder,
             optimizer.zero_grad(set_to_none=True)
             (loss + config['misc']['lambdaZ'] * z_penalty(z_geo, z_field)).backward()
 
+
             nets = {'geo': geo_net(model), 'field': model.FieldNet, 'enc': encoder}
             for name, net in nets.items():
                 if net is None:
@@ -296,6 +304,7 @@ def finetune(model, encoder,
 
             print(f'VALIDATION [Epoch {epoch+1}]:')
             print(f"loss: {val:>7f}")
+
 
     optimizer.zero_grad(set_to_none=True)
     print("Stage 3 Training Complete!")
@@ -443,6 +452,10 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
         # per-variable stats over the training split; they are buffers, so every checkpoint keeps them
         encoder.w_mean.copy_(train_ds.W.mean((0, 1, 2)).view_as(encoder.w_mean))
         encoder.w_std.copy_(train_ds.W.std((0, 1, 2)).view_as(encoder.w_std))
+        # LOCAL GEOMETRY: the geometry standardizes its own input with the same stats
+        if not baseline:
+            model.LevelSetsNet.w_mean.copy_(encoder.w_mean)
+            model.LevelSetsNet.w_std.copy_(encoder.w_std)
 
         writer = SummaryWriter(os.path.join(log_dir, model_cfg['name']))
 
@@ -457,14 +470,7 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
                        x_cell = x_cell, writer = writer,
                        config = train_cfg,
                        checkpoint_dir = os.path.join(checkpth, 'stage2.pt'))
-        # AUDIT fix: stage 2 trains the whole encoder (field.encoder: all) so z_field reads the plateaus exactly, which
-        # moves z_geo; refit the geometry to it with the trunk frozen (stage 1 again, only LevelSetsNet + the z_geo head)
-        if not baseline and 'geometry_refit' in train_cfg:
-            train_geometry(model = model, encoder = encoder,
-                        train_loader = train_loader, val_loader = val_loader,
-                        x_cell = x_cell, writer = writer,
-                        config = {**train_cfg, 'geometry': train_cfg['geometry_refit']},
-                        checkpoint_dir = os.path.join(checkpth, 'stage2_refit.pt'), tag = 'refit')
+        # LOCAL GEOMETRY: no geometry refit. The geometry does not read the encoder, so stage 2 moving it changes nothing
         finetune(model = model, encoder = encoder,
                        train_loader = train_loader, val_loader = val_loader,
                        x_cell = x_cell, writer = writer,
@@ -484,10 +490,8 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
         return model, encoder
 
 if __name__ == '__main__':
-
     train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'model_config.yaml',
                  train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'train_config.yaml')
-  
 
     # train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'model_config.yaml',
     #              train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'train_config.yaml',
