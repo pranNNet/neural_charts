@@ -52,8 +52,8 @@ physics:
   jump: 
     Mn_gate: 1.05
     speed_rel_tol: 0.01 # ⚑ interface_speed falls back to mean v.n below this relative density jump
-    width: 8   # cells, constraint at full strength out to here; must be >= side_offset. ⚑ guess
-    taper: 4   # cells, cosine taper to 0 after width. ⚑ guess
+    width: 5   # cells, constraint at full strength out to here; must be >= side_offset. ⚑ guess
+    taper: 2   # cells, cosine taper to 0 after width. ⚑ guess
   fronts:
     tau_p: 0.10 #pressure-rise threshold for definingn a front as shock
     side_offset: 4 # cells, plateau read distance from the front; also the label check distance in front_distances, so a zone narrower than this has no front ⚑

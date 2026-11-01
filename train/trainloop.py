@@ -417,9 +417,8 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
 
         savepth = os.path.join(train_cfg['path']['save_path'], model_cfg['name'])
         checkpth = os.path.join(savepth, 'checkpoint')
-        os.makedirs(os.path.dirname(log_dir), exist_ok=True)
-        os.makedirs(os.path.dirname(train_cfg['path']['save_path']), exist_ok=True)
-        os.makedirs(os.path.dirname(checkpth), exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)      # not dirname: a bare name like 'logs' gives '' and makedirs('') raises
+        os.makedirs(checkpth, exist_ok=True)     # also creates save_path and savepth
 
         #data: one-step pairs for stages 1-3, R-step windows and full val rollouts for stage 4
         path, t0 = train_cfg['path']['data_path'], train_cfg['data']['t0']
