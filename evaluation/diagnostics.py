@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import torch
 
 import preprocessing                                    # puts euler1d-data on the path
-from infrastructure.results import ExactRiemannSolver
+from euler1d_data.infrastructure.results import ExactRiemannSolver
 from preprocessing.exact import wave_speeds
 from preprocessing.jump_flags import jump_flags
 from model.neural_chart import NeuralChart1DST
