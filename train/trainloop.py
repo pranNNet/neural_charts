@@ -2,6 +2,8 @@ from pathlib import Path
 import os
 import yaml
 import numpy as np
+import multiprocessing
+
 
 import torch
 import torch.nn as nn
@@ -482,9 +484,31 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
         return model, encoder
 
 if __name__ == '__main__':
-    train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'model_config.yaml',
-                 train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'train_config.yaml')
 
+    def seperate(func):
+        p = multiprocessing.Process(func)
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f'Process {p.name} exited with code {p.exitcode}')
+        
+    multiprocessing.set_start_method('spawn', force=True)
+    seperate(
+        train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'model_config.yaml',
+                     train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'train_config.yaml')
+    )
+
+    seperate(
+        train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'model_config.yaml',
+                     train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'train_config.yaml',
+                     baseline=True)
+    )
+
+    seperate(
+        train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one_free' / 'model_config.yaml',
+                     train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one_free' / 'train_config.yaml')    
+    )
+  
     # train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'model_config.yaml',
     #              train_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'baseline_one' / 'train_config.yaml',
     #              baseline=True)
