@@ -1,8 +1,8 @@
 '''
 Lean evaluation core for the old (global-latent) model. Its job is to motivate the localfield architecture, so it
-makes two figures only. No oracle, no cross-model comparison.
+makes three figures only. No oracle, no cross-model comparison.
 
-    python -m evaluation.motivation                        (from the repo root: both figures)
+    python -m evaluation.motivation                        (from the repo root: every figure)
     python -m evaluation.motivation --figs profiles --split test_ood --case 3
 
 Figures (results/motivation/):
@@ -13,6 +13,10 @@ Figures (results/motivation/):
                                              distance to the exact front, one step from FV data. A level-set
                                              function is the line y = d through 0; a step (labels, not distances)
                                              is what stage 1's CE + boundary loss asks for.
+
+    influence  influence.png                 which input cells the model reads to answer at one point behind
+                                             the shock: the whole domain, through the global latents (compare
+                                             localfield's influence.png: a +-8 / +-15 cell window)
 
 Model loading and the rollout are the ones in evaluation.diagnostics.
 '''
@@ -31,13 +35,13 @@ import evaluation.diagnostics as D
 from evaluation.diagnostics import (MODELS, COLORS, DEVICE, XC, DX, T_TRAIN, T_MIN, T_END, X0,
                                     load_model, rollout, cons_to_prim, exact_case)
 from train.dataset import SnapshotDataset
+from model.transforms import MSFourier_Features
 
 OUT = D.ROOT / "results" / "motivation"
 SPLITS = ('test_id', 'test_ood')
 WAVES = ('contact', 'shock')
 CLIP = 3                                            # cells: localfield's distance target is clipped here
 VARS = ('rho', 'v', 'p')
-
 
 class Split:
     '''One split from t = 0 to T_END: FV W [C, S, 512, 3], exact W_ex (primitives), classes [C, S, 512], t [S],
@@ -62,7 +66,6 @@ class Split:
     def mid_case(self):
         return int(np.argsort(self.r)[self.C // 2])
 
-
 def available_models():
     out = {}
     for arm, (cfg, ckpt) in MODELS.items():
@@ -72,13 +75,11 @@ def available_models():
             print(f'skipping {arm}: no checkpoint at {ckpt}')
     return out
 
-
 def save(fig, name):
     OUT.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT / name, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'saved {OUT / name}')
-
 
 # ======================================================================================
 # Profile animation
@@ -126,7 +127,6 @@ def fig_profiles(models, sp, c, fps=12):
     plt.close(fig)
     print(f'saved {path}')
 
-
 # ======================================================================================
 # Level-set check
 # ======================================================================================
@@ -139,7 +139,6 @@ def zone_pair(cls, x):
         return None
     a, b = cls[left[-1]], cls[right[0]]
     return (int(a), int(b)) if a != b else None
-
 
 @torch.no_grad()
 def psi_samples(model, encoder, sp, every=5, half=8, per_cell=4):
@@ -164,14 +163,12 @@ def psi_samples(model, encoder, sp, every=5, half=8, per_cell=4):
                 out[wave][2].append(np.full(len(off), sp.t[n] > T_TRAIN + 1e-9))
     return {w: tuple(np.concatenate(v) for v in vals) for w, vals in out.items() if vals[0]}
 
-
 def levelset_stats(d, psi, fit=2.5):
     '''Straight-line fit of psi within +-fit cells: its zero (cells), R^2 (1 = distance-like) and slope.'''
     m = np.abs(d) <= fit
     A = np.polyfit(d[m], psi[m], 1)
     res = psi[m] - np.polyval(A, d[m])
     return -A[1] / A[0], 1 - res.var() / psi[m].var(), A[0]
-
 
 def fig_levelset(models, splits, arm='full'):
     """One plot: psi = phi_a - phi_b of the old full arm against signed distance to the exact front, one step from
@@ -201,9 +198,61 @@ def fig_levelset(models, splits, arm='full'):
     fig.tight_layout()
     save(fig, 'levelset.png')
 
+def fig_influence(models, sp, c, arm='full', t_show=0.12, behind=4):
+    """Which input cells the old model reads to answer at one point, the same figure as localfield's influence.png.
+    One step from the FV data of case c at t_show, x0 = `behind` cells behind the exact shock; for each input cell
+    x: |d out(x0) / d W(t_n)(x)|, summed over the input (rho, v, p) and the outputs, normalised by its maximum.
+        geometry   out = phi_k(x0), all k            (reads Fourier(x0) and z_geo)
+        field      out = W_k(x0) of the owning zone   (reads Fourier(x0) and z_field)
+    The latents come from the encoder of the whole field, so the influence spreads over the whole domain
+    (localfield: a +-8 / +-15 cell window, 0 outside)."""
+    if arm not in models:
+        return
+    model, encoder = models[arm]
+    j = int(np.argmin(np.abs(sp.t - t_show)))
+    x0 = sp.x_exact(c, sp.t[j])[1] - behind * DX
+    u0 = torch.tensor([[2 * x0 - 1]], dtype=torch.float32, device=DEVICE)
 
-FIGS = ('profiles', 'levelset')
+    def outputs(W_grid):
+        z_geo, z_field = encoder(W_grid)
+        out = {}
+        if model.geo_mode == 'levelset':
+            phi = model.geo_phi(u0, z_geo[:1])
+            out['geometry: phi(x0)'] = phi[0]
+            k = int(phi.argmax(-1))
+        else:
+            k = 0
+            z_field = torch.cat([z_geo, z_field], dim=-1)
+        W_k = model.heads_fn(model.FieldNet(MSFourier_Features(u0, model.B_field), z_field[:1]))[0, k]
+        out['field: W_k(x0)'] = W_k
+        return out
 
+    curves = {}
+    with torch.enable_grad():
+        W_grid = torch.as_tensor(sp.W[c:c + 1, j]).float().to(DEVICE).transpose(1, 2)
+        for name in outputs(W_grid):
+            total = np.zeros(len(XC))
+            for k in range(outputs(W_grid)[name].numel()):
+                W_grid = W_grid.detach().requires_grad_(True)
+                g, = torch.autograd.grad(outputs(W_grid)[name].reshape(-1)[k], W_grid)
+                total += g[0].abs().sum(0).cpu().numpy()
+            curves[name] = total / max(total.max(), 1e-30)
+
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    for (name, inf), color in zip(curves.items(), ('C0', 'C1')):
+        ax.plot(XC, inf, color=color, lw=1.5, label=name)
+    ax.axvline(x0, color='k', lw=1, label='query point x0')
+    for x in sp.x_exact(c, sp.t[j]):
+        ax.axvline(x, color='0.5', ls=':', lw=1)
+    ax.set(xlabel='input cell x', ylabel='influence on output at x0 (normalised)', xlim=(0, 1),
+           title=f'old {arm}: what the model reads to answer at x0 ({behind} cells behind the shock), '
+                 f'r = {sp.r[c]:.2f}, t = {sp.t[j]:.3f}')
+    ax.title.set_fontsize(9)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    save(fig, 'influence.png')
+
+FIGS = ('profiles', 'levelset', 'influence')
 
 def main():
     ap = argparse.ArgumentParser()
@@ -222,7 +271,9 @@ def main():
             fig_profiles(models, sp, sp.mid_case() if args.case is None else args.case)
     if 'levelset' in args.figs:
         fig_levelset(models, splits)
-
+    if 'influence' in args.figs:
+        sp = splits['test_id']
+        fig_influence(models, sp, sp.mid_case() if args.case is None else args.case)
 
 if __name__ == '__main__':
     main()
