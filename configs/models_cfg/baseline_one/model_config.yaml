@@ -21,7 +21,7 @@ field:                    # AUDIT 5: unused eps removed; the blend width is fine
     kernel: 7             # 5 layers x (kernel // 2) = +-15 cells: covers the jump layer's reach from the far side
   fieldnet:
     regions: 4 #number of zones, also listed as K (one-region arm: the model uses K = 1, N_e = 1)
-    hidden_layers: [128, 128, 128, 128]
+    hidden_layers: [194, 194, 194, 194]
     field_output: 3
     # AUDIT 7: N_dist removed (always zeros)
     N_e: 8 # N_e-number ID for each zone k

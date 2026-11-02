@@ -54,6 +54,7 @@ private_notes
 *.lcov
 .hypothesis/
 .pytest_cache/
+.Identifier
 cover/
 
 # Translations

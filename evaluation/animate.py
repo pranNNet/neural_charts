@@ -1,103 +1,91 @@
 '''
-Animation of the rollout profiles: rho, v, p against x from t0 = 0.02 to 0.24, one frame per step,
-for every arm with a checkpoint (diagnostics.MODELS: full, free-jump, one-region), over the FV cell
-averages and the exact solution. Frames past T_train = 0.16 are the held-out time band.
+Profile animation: rho, v, p against x over the rollout (t0 = 0.02 to 0.24) for every arm with a checkpoint
+(full, free-jump, one-region), over the FV data (dots) and the exact solution. The axes turn grey in the
+held-out time band (t > 0.16).
 
-    python -m evaluation.animate                          (from the project root: mid-r case of test_id)
-    python -m evaluation.animate test_ood 3 --ref exact   (split, case index; --ref fv | exact | both)
+    python -m evaluation.animate                      (from the repo root: mid-r case of test_id and test_ood)
+    python -m evaluation.animate --split test_ood --case 3
+    python -m evaluation.animate --t_end 0.32         (roll out past the data; exact only after t = 0.24)
 
-Output goes to results/animations/<split>_<case>.mp4 (.gif if ffmpeg is missing).
+Past the last snapshot (0.24) there is no FV data: the models keep stepping on their own output and are drawn
+against the exact solution (point values). For the strongest cases the waves reach x = 0 or 1 near t = 0.34; the
+exact solution is for an infinite domain, so stop before that.
+
+Output: results/diagnostics/profiles_<split>_<case>.mp4 (needs ffmpeg).
 '''
 
 import argparse
-import os
+
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import animation
 
-import evaluation.diagnostics as D
-from evaluation.diagnostics import (T_TRAIN, T_END, MODELS, COLORS, DEVICE, XC,
-                                    load_model, rollout, start_index, cons_to_prim)
-from train.dataset import SnapshotDataset
+import evaluation.helper as H
+from evaluation.helper import ( COLORS, SPLITS, T_TRAIN, T_END, XC, VARS, Split, available_models, rollout,
+                               exact_profile)
 
-OUT = D.ROOT / 'results' / 'animations'
+def animate(models, sp, c, fps=12, t_end=T_END):
+    '''rho, v, p against x over the rollout of case c to t_end: every arm, the FV data (dots, while it lasts) and
+    the exact solution. The axes turn grey in the held-out time band.'''
+    t = sp.t[sp.n0:]
+    W_fv, W_ex = sp.W[c, sp.n0:], sp.W_ex[c, sp.n0:]
+    dt = t[-1] - t[-2]
+    extra = max(0, int(round((t_end - t[-1]) / dt)))                       # steps past the data
+    if extra:
+        t_more = t[-1] + dt * np.arange(1, extra + 1)
+        t = np.concatenate([t, t_more])
+        W_fv = np.concatenate([W_fv, np.full((extra,) + W_fv.shape[1:], np.nan)])
+        W_ex = np.concatenate([W_ex, np.stack([exact_profile(sp.r[c], tt) for tt in t_more])])
+    arms = {a: np.concatenate([W_fv[:1], rollout(m, sp, cases=[c], n_steps=len(t) - 1)['W'][0]])
+            for a, m in models.items()}                                    # t0: the shared input
 
-
-def profiles(split, c):
-    '''(t [T+1], r, {name: W [T+1, 512, 3]}, W_fv, W_ex): every arm's rollout of one case, t0 first.'''
-    ds = SnapshotDataset(D.DATA, split, t_max=T_END, exact=True)
-    n0 = start_index(ds)
-    t = ds.t[n0:].numpy() * T_TRAIN
-    W0 = ds.W[c:c + 1, n0]
-    runs = {}
-    for name, (cfg, ckpt) in MODELS.items():
-        if not ckpt.exists():
-            print(f'skipping {name}: no checkpoint at {ckpt}')
-            continue
-        model, encoder = load_model(cfg, ckpt)
-        W = rollout(model, encoder, W0, len(t) - 1, ds.x_centers.to(DEVICE))[0]['W']
-        runs[name] = np.concatenate([W0.double().numpy(), W])                      # t0 is the shared input
-    W_ex = cons_to_prim(ds.U_exact[c, n0:].double().numpy())
-    return t, float(ds.r[c]), runs, ds.W[c, n0:].double().numpy(), W_ex
-
-
-def animate(split, c, ref='both', fps=12):
-    t, r, runs, W_fv, W_ex = profiles(split, c)
-    fig, ax = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
     lines = []
-    for row, var in enumerate(['rho', 'v', 'p']):
-        a = ax[row]
-        if ref in ('fv', 'both'):
-            lines.append((a.plot(XC, W_fv[0, :, row], '.', ms=2, color='0.6', label='FV')[0], W_fv, row))
-        if ref in ('exact', 'both'):
-            lines.append((a.plot(XC, W_ex[0, :, row], 'k-', lw=1, label='exact')[0], W_ex, row))
-        for name, W in runs.items():
-            lines.append((a.plot(XC, W[0, :, row], color=COLORS[name], lw=1.2, label=name)[0], W, row))
-        lo, hi = W_ex[..., row].min(), W_ex[..., row].max()                      # exact range + 25%: a model
-        pad = 0.25 * max(hi - lo, 0.1 * abs(hi))                                   # that leaves it is clipped
-        a.set_ylim(lo - pad, hi + pad)
-        a.set_ylabel(var)
-    ax[-1].set_xlabel('x')
-    ax[0].legend(fontsize=8, loc='upper right')
+    for row, (ax, var) in enumerate(zip(axes, VARS)):
+        lines.append((ax.plot(XC, W_fv[0, :, row], '.', ms=2, color=COLORS['FV'], label='FV')[0], W_fv, row))
+        lines.append((ax.plot(XC, W_ex[0, :, row], 'k-', lw=0.8, label='exact')[0], W_ex, row))
+        for a, W in arms.items():
+            lines.append((ax.plot(XC, W[0, :, row], color=COLORS[a], lw=1.2, label=a)[0], W, row))
+        lo, hi = W_ex[..., row].min(), W_ex[..., row].max()
+        pad = 0.25 * max(hi - lo, 0.1 * abs(hi))
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_ylabel(var)
+    axes[-1].set_xlabel('x')
+    axes[0].legend(fontsize=8, loc='upper right', ncol=2)
     title = fig.suptitle('')
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
 
     def frame(j):
         for line, W, row in lines:
             line.set_ydata(W[j, :, row])
-        held = ' (held-out time band)' if t[j] > T_TRAIN + 1e-9 else ''
-        title.set_text(f'{split}, case {c}, r = {r:.2f}:  t = {t[j]:.3f}{held}')
-        return [line for line, _, _ in lines] + [title]
+        out = t[j] > T_TRAIN + 1e-9
+        for ax in axes:
+            ax.set_facecolor('0.93' if out else 'white')
+        note = '  (past the data: exact only)' if t[j] > T_END + 1e-9 else '  (held-out time band)' if out else ''
+        title.set_text(f'{sp.name}, r = {sp.r[c]:.2f}, t = {t[j]:.3f}' + note)
+        return [l for l, _, _ in lines] + [title]
 
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    anim = animation.FuncAnimation(fig, frame, frames=len(t), blit=False)
-    os.makedirs(OUT, exist_ok=True)
-    if animation.writers.is_available('ffmpeg'):
-        path = OUT / f'{split}_{c}.mp4'
-        anim.save(path, writer=animation.FFMpegWriter(fps=fps), dpi=120)
-    else:
-        path = OUT / f'{split}_{c}.gif'
-        anim.save(path, writer=animation.PillowWriter(fps=fps), dpi=80)
+    anim = animation.FuncAnimation(fig, frame, frames=len(t))
+    H.OUT.mkdir(parents=True, exist_ok=True)
+    path = H.OUT / f'profiles_{sp.name}_{c}' + (f'_t{t_end:g}' if t_end > T_END + 1e-9 else '') + '.mp4'
+    anim.save(path, writer=animation.FFMpegWriter(fps=fps), dpi=120)
     plt.close(fig)
     print(f'saved {path}')
-    return path
-
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('split', nargs='?', default='test_id')
-    ap.add_argument('case', nargs='?', type=int, help='case index in the split (default: mid r)')
-    ap.add_argument('--ref', default='both', choices=['fv', 'exact', 'both'])
+    ap.add_argument('--split', choices=SPLITS, help='default: both')
+    ap.add_argument('--case', type=int, help='case index in the split (default: mid r)')
     ap.add_argument('--fps', type=int, default=12)
+    ap.add_argument('--t_end', type=float, default=T_END, help='roll out to this time (past 0.24: exact only)')
     args = ap.parse_args()
 
-    c = args.case
-    if c is None:                                                                  # mid r, as diagnostics.picks
-        r = SnapshotDataset(D.DATA, args.split).r.numpy()
-        c = int(np.argsort(r)[len(r) // 2])
-    animate(args.split, c, args.ref, args.fps)
-
+    models = available_models()
+    if not models:
+        return
+    for name in ([args.split] if args.split else SPLITS):
+        sp = Split(name)
+        animate(models, sp, sp.mid_case() if args.case is None else args.case, args.fps, args.t_end)
 
 if __name__ == '__main__':
     main()

@@ -99,8 +99,10 @@ class FieldNet(nn.Module):
         """Standardized W_grid [B, C, N] -> g_grid [B, C_f, N]. Once per step."""
         return self.features(W_std)
 
-    def forward(self, delta, g):
-        """delta [N, 1] offset from the nearest cell centre in cells, g [N, C_f] local features -> [N, K, F]."""
+    def forward(self, delta, g, return_parts=False):
+        """delta [N, 1] offset from the nearest cell centre in cells, g [N, C_f] local features -> [N, K, F].
+        return_parts (evaluation hook, no parameters): also return the coefficients a [N, K, M, F] and the
+        bases b [N, M, F]."""
         x = delta
         for layer in self.layers[0:-1]:
             x = layer(x, g)                                                # [N, H]
@@ -109,7 +111,8 @@ class FieldNet(nn.Module):
         b = self.layers[-1](x).view(N, self.N_bases, self.N_out)                         # [N, M, F]
         e = self.embed()                                                   # [K, N_e]
         a = self.coeff(build_cond(g, e)).view(N, e.shape[0], self.N_bases, self.N_out)  # [N, K, M, F]
-        return torch.einsum('nkmf,nmf->nkf', a, b)                         # [N, K, F]
+        W = torch.einsum('nkmf,nmf->nkf', a, b)                            # [N, K, F]
+        return (W, a, b) if return_parts else W
 
 def positive_clamp(R):
 
