@@ -15,7 +15,9 @@ Figures (results/diagnostics/):
     regions      region_fields.png             each zone's field W_k over the WHOLE domain (full arm): solid
                                                where the zone owns the cell, faint where it is an extension
     levelset     levelset.png                  one plot: the full arm's psi (median, in cells) against signed
-                                               distance to the exact front, contact and shock, with the target
+                                               distance to the front, contact and shock, with the target. Solid:
+                                               FV input, exact front. Dotted: its own rollout state as input,
+                                               distance to the front measured in that state
     fronts       fronts.png                    contact and shock position error vs t, from the field (rho
                                                crosses half way between the exact plateaus): same rule for
                                                every arm and the FV data
@@ -24,6 +26,8 @@ Figures (results/diagnostics/):
     basis        basis.png                     how the FieldNet bases are used: singular values of the per-basis
                                                contributions a_{k(x)m}(x) b_m(x) to rho, and their top modes
                                                (uses the FieldNet return_parts hook in model/region.py)
+    influence    influence.png                 which input cells the geometry and the field read to answer at one
+                                               point behind the shock: a +-8 / +-15 cell window, 0 outside
     zonemap      zonemap_<split>_<case>.png    x-t map of the zone labels with the psi = 0 fronts and the exact
                                                wave paths (level-set arms)
 '''
@@ -42,7 +46,6 @@ import evaluation.helper as H
 from evaluation.helper import (COLORS, SPLITS, ALL_SPLITS, RIGHT, T_TRAIN, N, DX, XC, X0, SIDE, WAVES, VARS, GAMMA,
                                DEVICE, Split, available_models, rollouts, held_out, save)
 
-
 # ======================================================================================
 # Measurements (the same rule for every arm and the FV data)
 # ======================================================================================
@@ -50,7 +53,6 @@ from evaluation.helper import (COLORS, SPLITS, ALL_SPLITS, RIGHT, T_TRAIN, N, DX
 def rel_l1_t(W, W_ex):
     '''[..., T] relative L1 of each snapshot over the cells, mean over (rho, v, p).'''
     return (np.abs(W - W_ex).sum(-2) / np.abs(W_ex).sum(-2)).mean(-1)
-
 
 def front_position(rho, x_ex, level, search=15):
     '''Where rho [512] crosses `level` (linear between centres), the crossing nearest x_ex within +-search cells;
@@ -64,7 +66,6 @@ def front_position(rho, x_ex, level, search=15):
     xs = XC[i - search + k] + DX * f[k] / (f[k] - f[k + 1])
     return xs[np.argmin(np.abs(xs - x_ex))]
 
-
 def fronts_of(W, sp, c, t):
     '''[T, 2] measured (contact, shock) positions of W [T, 512, 3] for case c at times t.'''
     e = sp.exact[c]
@@ -72,19 +73,16 @@ def fronts_of(W, sp, c, t):
     x_ex = sp.x_exact(c, t)
     return np.array([[front_position(W[j, :, 0], x_ex[j, w], levels[w]) for w in range(2)] for j in range(len(t))])
 
-
 def euler_flux(W):
     rho, v, p = W[..., 0], W[..., 1], W[..., 2]
     E = p / (GAMMA - 1) + 0.5 * rho * v * v
     return np.stack([rho * v, rho * v * v + p, v * (E + p)], -1), np.stack([rho, rho * v, E], -1)
-
 
 def rh_residual(W_up, W_dn, s):
     '''|F(U_dn) - F(U_up) - s (U_dn - U_up)| / |F(U_up)|, lab-frame speed s. 0 for a jump that satisfies RH.'''
     (F_up, U_up), (F_dn, U_dn) = euler_flux(W_up), euler_flux(W_dn)
     num = np.linalg.norm(F_dn - F_up - s[..., None] * (U_dn - U_up), axis=-1)
     return num / np.linalg.norm(F_up, axis=-1)
-
 
 def shock_terms(W, x_s, t, sp, c, half=5):
     '''At the measured shock x_s [T]: speed s (line fit over +-half steps), the states SIDE cells either side,
@@ -106,7 +104,6 @@ def shock_terms(W, x_s, t, sp, c, half=5):
     down = np.where(bad, np.nan, np.abs(W_dn - e['W_star_R']).sum(-1) / np.abs(e['W_star_R']).sum())
     return rh, speed, down
 
-
 def zone_pair(cls, x):
     '''Zones (a, b) either side of position x from the data classes [512] (-1 = unlabelled): the nearest
     labelled cell on each side.'''
@@ -116,7 +113,6 @@ def zone_pair(cls, x):
         return None
     a, b = cls[left[-1]], cls[right[0]]
     return (int(a), int(b)) if a != b else None
-
 
 # ======================================================================================
 # Accuracy
@@ -158,7 +154,6 @@ def fig_accuracy(runs, splits):
     for s, a, x, y in rows:
         print(f'{s:9s} {a:11s} {x:11.4f} {y:9.4f}')
 
-
 # ======================================================================================
 # Region fields
 # ======================================================================================
@@ -192,28 +187,33 @@ def fig_regions(runs, sp, c, arm='full', times=(0.12, 0.20)):
     fig.tight_layout()
     save(fig, 'region_fields.png')
 
-
 # ======================================================================================
 # Level-set check
 # ======================================================================================
 
 @torch.no_grad()
-def psi_samples(model, sp, every=5, half=8, per_cell=4):
-    '''One step from the FV data at every `every`-th snapshot of every case: psi = phi_a - phi_b on a fine grid
-    (per_cell points per cell) within +-half cells of each exact front at t_n, with (a, b) the data zones either
-    side. Returns {wave: (d [P] signed distance in cells, + on the a (left) side, psi [P], held_out [P])}.'''
+def psi_samples(model, sp, W_in=None, every=5, half=8, per_cell=4):
+    """psi = phi_a - phi_b on a fine grid (per_cell points per cell) within +-half cells of each front, at every
+    `every`-th snapshot n of every case, (a, b) the data zones either side of that wave.
+    W_in None: the input is the FV data and the front is the exact one (one step from data).
+    W_in [C, S, 512, 3] (a rollout's own states, aligned with sp.t): the input is that state and the front is the one
+    measured on it (rho crossing half way, fronts_of), so d is the distance to the front the model actually sees.
+    Returns {wave: (d [P] signed distance in cells, + on the a (left) side, psi [P], held_out [P])}."""
+    rollout_in = W_in is not None
+    W_in = sp.W if W_in is None else W_in
     out = {w: ([], [], []) for w in WAVES}
     off = np.arange(-half * per_cell, half * per_cell + 1) / per_cell                 # cells from the front
     for n in range(sp.n0, len(sp.t) - 1, every):
-        W_grid = torch.as_tensor(sp.W[:, n]).float().to(DEVICE).transpose(1, 2)
+        W_grid = torch.as_tensor(W_in[:, n]).float().to(DEVICE).transpose(1, 2)
         model.set_features(W_grid)
         for c in range(sp.C):
             x_ex = sp.x_exact(c, sp.t[n])
+            x_fr = fronts_of(W_in[c, n:n + 1], sp, c, sp.t[n:n + 1])[0] if rollout_in else x_ex
             for w, wave in enumerate(WAVES):
                 pair = zone_pair(sp.classes[c, n], x_ex[w])
-                if pair is None:
+                if pair is None or not np.isfinite(x_fr[w]):
                     continue
-                x = x_ex[w] + off * DX
+                x = x_fr[w] + off * DX
                 u = torch.as_tensor(2 * x - 1).float().to(DEVICE)[:, None]
                 phi = model.geo_phi(u, torch.full((len(u),), c, device=DEVICE)).cpu().numpy()
                 out[wave][0].append(-off)
@@ -221,33 +221,54 @@ def psi_samples(model, sp, every=5, half=8, per_cell=4):
                 out[wave][2].append(np.full(len(off), sp.t[n] > T_TRAIN + 1e-9))
     return {w: tuple(np.concatenate(v) for v in vals) for w, vals in out.items() if vals[0]}
 
+def rollout_inputs(R, sp):
+    """A rollout's input states aligned with sp.t: the FV state at n0, then the model's own outputs."""
+    W = np.full_like(sp.W, np.nan)
+    W[:, sp.n0] = sp.W[:, sp.n0]
+    W[:, sp.n0 + 1:] = R['W']
+    return W
 
-def fig_levelset(models, splits, arm='full'):
-    """One plot: psi = phi_a - phi_b of one arm against signed distance to the exact front, one step from FV data,
-    median over every case and snapshot of the splits, for the contact and the shock. psi is divided by the
-    target's slope 2 kappa, so it reads in cells and the target is the line clamp(d, +-3). A learned level-set
-    function sits on that line and crosses 0 at d = 0; the legend gives psi there (cells)."""
+def fig_levelset(models, splits, runs=None, arm='full'):
+    """One plot: psi = phi_a - phi_b of one arm against signed distance to the front, for the contact and the
+    shock. psi is divided by the target's slope 2 kappa, so it
+    reads in cells and the target is the line clamp(d, +-3). A learned level-set function sits on that line and
+    crosses 0 at d = 0; the legend gives psi there (cells).
+    Lines are means over every case and sampled snapshot (every 5th). W_gt (solid): the input is the solver's
+    state at t_n, d to the exact front. W_pred (dotted, with a +-1 std band): the input is the arm's own rollout
+    state at t_n (the model stepping on its own output from t0 = 0.02 to 0.24, every 5th step pooled), d to the front
+    measured in that state. W_pred on W_gt = the geometry stays a level set on the model's own outputs; an offset or
+    bend = part of the rollout's front error is geometric.
+    """
     if arm not in models or models[arm].geo_mode != 'levelset':
         return
-    samples = [psi_samples(models[arm], sp) for sp in splits.values()]
-    fig, ax = plt.subplots(figsize=(6, 4.5))
+    sources = [(r'$W_{gt}$', [psi_samples(models[arm], sp) for sp in splits.values()], '-', False)]
+    if runs is not None:                                   # every 5th step of the whole rollout, t0 to T_END, pooled
+        sources.append((r'$W_{pred}$', [psi_samples(models[arm], sp, rollout_inputs(runs[name][arm], sp))
+                                        for name, sp in splits.items()], ':', True))
+    fig, ax = plt.subplots(figsize=(6.5, 4.8))
     dd = np.linspace(-8, 8, 200)
     ax.plot(dd, np.clip(dd, -CLIP, CLIP), 'k--', lw=1, label='target (distance, clipped at 3 cells)')
-    for wave, color in zip(WAVES, ('C3', 'C4')):
-        d, psi, _ = (np.concatenate(v) for v in zip(*[s[wave] for s in samples if wave in s]))
-        y = psi / (2 * KAPPA)
-        grid = np.unique(d)
-        med = np.array([np.median(y[d == g]) for g in grid])
-        at0 = med[np.argmin(np.abs(grid))]
-        ax.plot(grid, med, color=color, lw=1.8, label=f'{wave} (psi at interface = {at0:+.3f} cells)')
+    for src, samples, ls, band in sources:
+        for wave, color in zip(WAVES, ('C3', 'C4')):
+            parts = [s[wave] for s in samples if wave in s]
+            if not parts:
+                continue
+            d, psi, _ = (np.concatenate(v) for v in zip(*parts))
+            y = psi / (2 * KAPPA)
+            grid = np.unique(d)
+            mean = np.array([y[d == g].mean() for g in grid])
+            at0 = mean[np.argmin(np.abs(grid))]
+            ax.plot(grid, mean, ls, color=color, lw=1.6, label=rf'{wave}, {src}: $\psi(0)$ = {at0:+.3f}')
+            if band:                                                       # +- 1 std over the pooled steps
+                std = np.array([y[d == g].std() for g in grid])
+                ax.fill_between(grid, mean - std, mean + std, color=color, alpha=0.15, lw=0)
     ax.axhline(0, color='0.8', lw=0.5)
     ax.axvline(0, color='0.8', lw=0.5)
-    ax.set(xlabel='signed distance to exact front (cells)', ylabel='psi / 2 kappa (cells)',
+    ax.set(xlabel='signed distance to front (cells)', ylabel=r'$\psi / 2\kappa$ (cells)',
            title=f'{arm}: learned level-set function', xlim=(-8, 8), ylim=(-4, 4))
-    ax.legend(fontsize=8, loc='upper left')
+    ax.legend(fontsize=7, loc='upper left')
     fig.tight_layout()
     save(fig, 'levelset.png')
-
 
 # ======================================================================================
 # Front error
@@ -277,7 +298,6 @@ def fig_fronts(runs, splits):
     fig.tight_layout()
     save(fig, 'fronts.png')
 
-
 # ======================================================================================
 # RH enforcement
 # ======================================================================================
@@ -306,7 +326,6 @@ def fig_rh(runs, splits):
     fig.tight_layout()
     save(fig, 'rh.png')
 
-
 # ======================================================================================
 # Basis usage
 # ======================================================================================
@@ -325,7 +344,6 @@ def contributions(model, W, x_cell, var=0):
     k = model.geo_phi(x, group).argmax(-1) if model.geo_mode == 'levelset' else torch.zeros_like(group)
     a_own = a[torch.arange(len(k)), k]                                                     # [P, M, F]
     return (a_own[..., var] * b[..., var]).view(B, N, -1).double().cpu().numpy()
-
 
 def fig_basis(models, sp, c, every=10, t_show=0.12):
     '''How each arm uses its M FieldNet bases for rho, one step from the FV data of every case of the split.
@@ -368,7 +386,6 @@ def fig_basis(models, sp, c, every=10, t_show=0.12):
     fig.tight_layout()
     save(fig, 'basis.png')
 
-
 # ======================================================================================
 # x-t zone map
 # ======================================================================================
@@ -382,7 +399,6 @@ def psi_zeros(phi, labels):
     sj = phi[i + 1, a] - phi[i + 1, b]
     frac = np.clip(si / np.where(si != sj, si - sj, 1), 0, 1)
     return XC[i] + frac * DX
-
 
 def fig_zonemap(runs, sp, c):
     '''x-t map of the zone labels of the rollout of case c (level-set arms). Black dots: psi = 0, the model's
@@ -410,11 +426,74 @@ def fig_zonemap(runs, sp, c):
     fig.tight_layout()
     save(fig, f'zonemap_{sp.name}_{c}.png')
 
-
 # ======================================================================================
 
-FIGS = ('accuracy', 'regions', 'levelset', 'fronts', 'rh', 'basis', 'zonemap')
+# ======================================================================================
+# Influence: what the CNN windows see
+# ======================================================================================
 
+def fig_influence(models, sp, c, arm='full', t_show=0.12, behind=4):
+    """Which input cells the model reads to answer at one point. One step from the FV data of case c at t_show,
+    query point x0 = `behind` cells behind the exact shock. For each input cell x: |d out(x0) / d W(t_n)(x)|, summed
+    over (rho, v, p) of the input and over the outputs, normalised by its maximum:
+        geometry   out = the zone scores phi_k(x0), all k        (GeoCNN window, +-8 cells)
+        field      out = W_k(x0) of the zone that owns x0          (FieldCNN window, +-15 cells)
+    Outside each window the influence is exactly 0: the output at x0 is a function of the local profile only."""
+    model = models.get(arm)
+    if model is None:
+        return
+    j = int(np.argmin(np.abs(sp.t - t_show)))
+    x_s = sp.x_exact(c, sp.t[j])[1]
+    x0 = x_s - behind * DX
+    u0 = torch.tensor([[2 * x0 - 1]], dtype=torch.float32, device=DEVICE)
+    rows = torch.zeros(1, dtype=torch.long, device=DEVICE)
+
+    def influence(out_fn):
+        total = np.zeros(N)
+        with torch.enable_grad():
+            n_out = out_fn(None).numel()
+            for k in range(n_out):
+                W_grid = torch.as_tensor(sp.W[c:c + 1, j]).float().to(DEVICE).transpose(1, 2).requires_grad_(True)
+                model.set_features(W_grid)
+                out = out_fn(W_grid).reshape(-1)[k]
+                g, = torch.autograd.grad(out, W_grid)
+                total += g[0].abs().sum(0).cpu().numpy()
+        return total / max(total.max(), 1e-30)
+
+    def geo(W_grid):
+        if W_grid is None:
+            model.set_features(torch.as_tensor(sp.W[c:c + 1, j]).float().to(DEVICE).transpose(1, 2))
+        return model.geo_phi(u0, rows)
+
+    def field(W_grid):
+        if W_grid is None:
+            model.set_features(torch.as_tensor(sp.W[c:c + 1, j]).float().to(DEVICE).transpose(1, 2))
+        k = model.geo_phi(u0, rows).argmax(-1) if model.geo_mode == 'levelset' else rows
+        return model.field_at(u0, rows)[0, k]
+
+    curves = {}
+    if model.geo_mode == 'levelset':
+        curves['geometry: phi(x0)  (GeoCNN, +-8 cells)'] = (influence(geo), 'C0', 8)
+    curves['field: W_k(x0)  (FieldCNN, +-15 cells)'] = (influence(field), 'C1', 15)
+
+    fig, ax = plt.subplots(figsize=(8, 3.8))
+    for label, (inf, color, half) in curves.items():
+        ax.axvspan(x0 - half * DX, x0 + half * DX, color=color, alpha=0.08, lw=0)
+        ax.plot(XC, inf, color=color, lw=1.5, label=label)
+    ax.axvline(x0, color='k', lw=1, label='query point x0')
+    for x in sp.x_exact(c, sp.t[j]):
+        ax.axvline(x, color='0.5', ls=':', lw=1)
+    ax.set(xlabel='input cell x', ylabel='influence on output at x0 (normalised)',
+           title=f'{arm}: what the model reads to answer at x0 ({behind} cells behind the shock), '
+                 f'r = {sp.r[c]:.2f}, t = {sp.t[j]:.3f}')
+    ax.title.set_fontsize(9)
+    ax.legend(fontsize=8)
+    lo, hi = x0 - 40 * DX, x0 + 40 * DX
+    ax.set_xlim(lo, hi)
+    fig.tight_layout()
+    save(fig, 'influence.png')
+
+FIGS = ('accuracy', 'regions', 'levelset', 'fronts', 'rh', 'basis', 'zonemap', 'influence')
 
 def main():
     ap = argparse.ArgumentParser()
@@ -437,7 +516,7 @@ def main():
     sp = splits[args.split]
     splits = {s: splits[s] for s in args.splits}
     c = sp.mid_case() if args.case is None else args.case
-    need_runs = set(args.figs) & {'accuracy', 'regions', 'fronts', 'rh', 'zonemap'}
+    need_runs = set(args.figs) & {'accuracy', 'regions', 'levelset', 'fronts', 'rh', 'zonemap'}
     runs = rollouts(models, splits) if need_runs else None
 
     if 'accuracy' in args.figs:
@@ -445,7 +524,7 @@ def main():
     if 'regions' in args.figs and 'full' in models:
         fig_regions(runs[args.split], sp, c)
     if 'levelset' in args.figs:
-        fig_levelset(models, splits)
+        fig_levelset(models, splits, runs)
     if 'fronts' in args.figs:
         fig_fronts(runs, splits)
     if 'rh' in args.figs:
@@ -454,7 +533,8 @@ def main():
         fig_basis(models, sp, c)
     if 'zonemap' in args.figs:
         fig_zonemap(runs[args.split], sp, c)
-
+    if 'influence' in args.figs:
+        fig_influence(models, sp, c)
 
 if __name__ == '__main__':
     main()
