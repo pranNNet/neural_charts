@@ -226,6 +226,7 @@ __marimo__/
 # Data
 .h5
 data
+slurm
 
 logs
 diagnostics

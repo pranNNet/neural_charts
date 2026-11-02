@@ -5,24 +5,12 @@ architecture:
   ablation:
     geometry: levelset  # levelset | none
     jump_mode: free      # RH | free
-    fourier: "on"       # on | off
     head: softplus      # softplus | linear
-  latent:
-    z_geo: 0            # LOCAL GEOMETRY: no geometry latent (the baseline keeps 8, it feeds FieldNet there)
-    z_field: 32
   coordinate_input: 1   # D: 1 for x, 2 for (x, y). t is not an input
-
-encoder:
-  type: cnn
-  N_grid: 512
-  conv_channels: [32, 64, 64, 64]   # ⚑ guess: 512 -> 32 cells
-  kernel: 5
-  encodernet:
-    input: 1
-    hidden_layers: [64, 64, 64]
+  N_grid: 512           # cells; was encoder.N_grid (LOCAL FIELDS: no encoder, no latents)
 
 geometry:                 # AUDIT 3: norm_delta removed (no phi_hat normalization)
-  features:               # LOCAL GEOMETRY: Conv1d stack on W(t_n), stride 1, replicate padding; replaces Fourier(x~) + z_geo
+  feature_cnn:            # LOCAL GEOMETRY: GeoFeatureCNN on W(t_n), stride 1, replicate padding; replaces Fourier(x~) + z_geo
     conv_channels: [64, 64, 64]   # ⚑ guess; plus a last linear conv into N_feat, so 4 layers
     N_feat: 32            # ⚑ guess
     kernel: 5             # 4 layers x (kernel // 2) = +-8 cells receptive field
@@ -31,12 +19,10 @@ geometry:                 # AUDIT 3: norm_delta removed (no phi_hat normalizatio
     phi_output: 4         # K, from the class table
 
 field:                    # AUDIT 5: unused eps removed; the blend width is finetune.eps in the train config
-  fourierfeatures:
-    seed: 1
-    bands:
-      - {n_freq: 22, sigma_x: 1.0}
-      - {n_freq: 21, sigma_x: 3.0}
-      - {n_freq: 21, sigma_x: 10.0}
+  feature_cnn:            # LOCAL FIELDS: FieldFeatureCNN on W(t_n), stride 1, replicate padding; replaces Fourier(x~) + z_field
+    conv_channels: [64, 64, 64, 64]   # ⚑ guess; plus a last linear conv into N_feat, so 5 layers
+    N_feat: 32            # C_f, ⚑ guess; also the FiLM and coeff conditioning size
+    kernel: 7             # 5 layers x (kernel // 2) = +-15 cells: covers the jump layer's reach from the far side
   fieldnet:
     regions: 4 #number of zones, also listed as K
     hidden_layers: [128, 128, 128, 128]
@@ -52,8 +38,8 @@ physics:
   jump: 
     Mn_gate: 1.05
     speed_rel_tol: 0.01 # ⚑ interface_speed falls back to mean v.n below this relative density jump
-    width: 5   # cells, constraint at full strength out to here; must be >= side_offset. ⚑ guess
-    taper: 2   # cells, cosine taper to 0 after width. ⚑ guess
+    width: 5   # cells, constraint at full strength out to here; must be >= side_offset. Was 8; raw FieldNet error near plateau from 5 cells (raw_field_vs_distance, val + test_ood)
+    taper: 2   # cells, cosine taper to 0 after width. Was 4; reach 7 + ~2 cells/step motion fits the +-9 geometry view
   fronts:
     tau_p: 0.10 #pressure-rise threshold for definingn a front as shock
     side_offset: 4 # cells, plateau read distance from the front; also the label check distance in front_distances, so a zone narrower than this has no front ⚑

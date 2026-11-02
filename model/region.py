@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from model.features import FeatureCNN
+
 # ======================================================================================
 # Region Embedding
 # ======================================================================================
@@ -22,7 +24,7 @@ class RegionEmbedding(nn.Module):
         return self.table(self.ids)
 
 def build_cond(z_field: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
-    """z_field [N, 32], e [K, 8] -> cond [N, K, 40]. expand() is a view, no copy."""
+    """z_field [N, C] (LOCAL FIELDS: g(x)), e [K, 8] -> cond [N, K, C + 8]. expand() is a view, no copy."""
 
     N, K = z_field.shape[0], e.shape[0]
     z = z_field.unsqueeze(1).expand(N, K, -1)        # [N, K, 32]: same z for every region
@@ -61,44 +63,53 @@ class FiLMLayer(nn.Module):
 
 class FieldNet(nn.Module):
     '''
-    Shared bases: a trunk conditioned on z_field gives N_bases functions of x per output,
-    and each region k mixes them with its own coefficients from [z_field; e_k].
+    Local shared bases (LOCAL FIELDS). A FieldFeatureCNN on the standardized W(t_n) gives g_grid [B, C_f, N]
+    once per step; g(x) is g_grid read at x (sample_grid). Then, as before but with local inputs:
+        trunk  delta(x) -> FiLM layers conditioned on g(x) -> N_bases functions b_mc per output
+        coeff  [g(x); e_k] -> a_kmc per region k
         W_kc(x) = sum_m a_kmc * b_mc(x)
+    delta = (x - nearest cell centre) / dx in [-0.5, 0.5]: relative position, which matters only at off-grid reads
+    (the pins). No x~, no Fourier features, no latent.
     '''
 
-    def __init__(self, N_in, N_regions,
-                 N_z_field, N_e_field,
-                 hidden_layers, N_out = 3, N_bases = 16):                 # AUDIT 7: no N_dist
+    def __init__(self, N_channels, N_regions, N_e_field,
+                 hidden_layers, N_out = 3, N_bases = 16, N_in = 1,
+                 conv_channels = [64, 64, 64, 64], N_feat = 32, kernel = 7):
         super().__init__()
 
         self.N_out, self.N_bases = N_out, N_bases
 
+        self.features = FeatureCNN(N_channels, conv_channels, N_feat, kernel)    # FieldFeatureCNN
         self.embed = RegionEmbedding(N_regions, N_e_field)
 
-        # trunk: FiLM on z_field only (N_e = 0), runs once per point
+        # trunk: FiLM on g(x) only (N_e = 0), runs once per point
         self.layers = nn.ModuleList(
-            [FiLMLayer(N_in, hidden_layers[0], N_z_field, 0)] +
-            [FiLMLayer(N_features, N_features, N_z_field, 0) for N_features in hidden_layers[1:]] +
+            [FiLMLayer(N_in, hidden_layers[0], N_feat, 0)] +
+            [FiLMLayer(N_features, N_features, N_feat, 0) for N_features in hidden_layers[1:]] +
             [nn.Linear(hidden_layers[-1], N_bases * N_out)]       # the bases b_mc(x)
         )
 
-        # per-region coefficients a_kmc from [z_field; e_k], nonlinear in z (AUDIT test: was one Linear)
-        self.coeff = nn.Sequential(nn.Linear(N_z_field + N_e_field, hidden_layers[-1]), nn.SiLU(),
+        # per-region coefficients a_kmc from [g(x); e_k]
+        self.coeff = nn.Sequential(nn.Linear(N_feat + N_e_field, hidden_layers[-1]), nn.SiLU(),
                                    nn.Linear(hidden_layers[-1], N_bases * N_out))
         with torch.no_grad():
             self.coeff[-1].bias.fill_(1 / N_bases)       # ⚑ each region starts near the mean of the bases
 
-    def forward(self, x, z_field):                                         # AUDIT 7: no dist input
+    def feat_grid(self, W_std):
+        """Standardized W_grid [B, C, N] -> g_grid [B, C_f, N]. Once per step."""
+        return self.features(W_std)
 
+    def forward(self, delta, g):
+        """delta [N, 1] offset from the nearest cell centre in cells, g [N, C_f] local features -> [N, K, F]."""
+        x = delta
         for layer in self.layers[0:-1]:
-            x = layer(x, z_field)                                          # [N, H]
+            x = layer(x, g)                                                # [N, H]
 
         N = x.shape[0]
         b = self.layers[-1](x).view(N, self.N_bases, self.N_out)                         # [N, M, F]
         e = self.embed()                                                   # [K, N_e]
-        a = self.coeff(build_cond(z_field, e)).view(N, e.shape[0], self.N_bases, self.N_out)  # [N, K, M, F]
+        a = self.coeff(build_cond(g, e)).view(N, e.shape[0], self.N_bases, self.N_out)  # [N, K, M, F]
         return torch.einsum('nkmf,nmf->nkf', a, b)                         # [N, K, F]
-
 
 def positive_clamp(R):
 

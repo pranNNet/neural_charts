@@ -10,21 +10,41 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from model.neural_chart import NeuralChart1DST
-from model.encoder import FieldEncoder
 from train.dataset import load_splits, RolloutDataset
 from train.helper import geometry_loss, cell_L1, front_loss, rollout_L1, val_L1
-from train.helper import z_penalty, geo_net, set_encoder_trainable
-
+from train.helper import geo_net
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
+# ======================================================================================
+# NaN guard
+# ======================================================================================
 
+NAN_PATIENCE = 20       # consecutive non-finite steps before a stage gives up
+
+def guarded_step(loss, params, optimizer, clip, state):
+    '''Clip, then step only if the loss and the gradient norm are finite. A non-finite step is skipped (no weight
+    update, so Adam's moments stay clean); NAN_PATIENCE in a row raises FloatingPointError, which stops this
+    model's run. state: {'bad': consecutive, 'total': all skipped}, one per stage.'''
+    gn = torch.nn.utils.clip_grad_norm_(params, clip)
+    if torch.isfinite(loss) and torch.isfinite(gn):
+        optimizer.step()
+        state['bad'] = 0
+        return True
+    optimizer.zero_grad(set_to_none=True)
+    state['bad'] += 1
+    state['total'] += 1
+    print(f'NaN GUARD: non-finite loss or gradient, step skipped ({state["total"]} so far, {state["bad"]} in a row)',
+          flush=True)
+    if state['bad'] >= NAN_PATIENCE:
+        raise FloatingPointError(f'{NAN_PATIENCE} non-finite steps in a row; stopping this run')
+    return False
 
 # ======================================================================================
 # Stage 1: geometry (segmentation of W^n)
 # ======================================================================================
 
-def train_geometry(model, encoder,
+def train_geometry(model,
                    train_loader, val_loader,
                    x_cell, writer,
                    config = Path(__file__).parent.parent / 'configs' / 'train_config.yaml',
@@ -33,11 +53,9 @@ def train_geometry(model, encoder,
 
     os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
 
-    # enable training on LevelSetsNet only (conv features + INR head). LOCAL GEOMETRY: the encoder is not used
-    # in stage 1 (nothing in the geometry reads it); it is passed only to keep it in the checkpoints
+    # enable training on LevelSetsNet only (its CNN + INR head)
     model.requires_grad_(False)
     model.LevelSetsNet.requires_grad_(True)
-    encoder.requires_grad_(False)
 
     # set up training components
     params = list(model.LevelSetsNet.parameters())
@@ -52,9 +70,9 @@ def train_geometry(model, encoder,
 
     #validation/checkpointing purposes
     step, best = 0, torch.inf
-    lambda_ce = config['geometry']['lambda_ce']
+    nan_guard = {'bad': 0, 'total': 0}
 
-    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
+    torch.save({'model': model.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
     print(f"Beginning {tag} Training...")
     for epoch in range(config['geometry']['epochs']):
         print(f"-------------------------------\nEpoch {epoch+1}\n-------------------------------")
@@ -63,8 +81,9 @@ def train_geometry(model, encoder,
         for batch in train_loader:
             batch = {key: val.to(x_cell.device) for key, val in batch.items()}
 
-            # CE + boundary loss at t_n from W^n, in one call. AUDIT 5: no eps schedule. LOCAL GEOMETRY: no latent
-            loss, ce, smooth, jump = geometry_loss(model, batch, x_cell, lambda_ce)
+            # DISTANCE TARGET: Huber of the zone scores vs phi* at t_n (centres + 1 random point per cell), replaces
+            # CE + boundary loss. LOCAL GEOMETRY: no latent
+            loss = geometry_loss(model, batch, x_cell)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -75,20 +94,14 @@ def train_geometry(model, encoder,
                 if g:   # frozen nets have no grads, skip them
                     writer.add_scalar(f'{tag}/grad_norm/{name}', torch.linalg.vector_norm(torch.stack([x.norm() for x in g])).item(), step)
 
-
-            torch.nn.utils.clip_grad_norm_(params, config['misc']['grad_clip'])
-            optimizer.step()
+            guarded_step(loss, params, optimizer, config['misc']['grad_clip'], nan_guard)   # NaN GUARD
             scheduler.step()
 
             writer.add_scalar(f'{tag}/train_loss', loss.item(), step)
             writer.add_scalar(f'{tag}/schedule/lr', scheduler.get_last_lr()[0], step)
-            writer.add_scalar(f'{tag}/loss/class ce', ce, step)
-            writer.add_scalar(f'{tag}/loss/jump loss', jump, step)
-            writer.add_scalar(f'{tag}/loss/smooth loss', smooth, step)
-
 
             step += 1
-            tot_loss += loss.item()
+            tot_loss += loss.item() if torch.isfinite(loss) else 0.0
 
         print('TRAIN:')
         print(f"loss: {tot_loss / len(train_loader):>7f}")
@@ -99,15 +112,14 @@ def train_geometry(model, encoder,
             with torch.no_grad():
                 for batch in val_loader:
                     batch = {key: val.to(x_cell.device) for key, val in batch.items()}
-                    vals.append(geometry_loss(model, batch, x_cell, lambda_ce)[0].item())   # AUDIT 5
+                    vals.append(geometry_loss(model, batch, x_cell).item())
 
                 val = np.mean(vals)
                 writer.add_scalar(f'{tag}/val_loss', val, step)
                 if val < best:
                     best = val
-                    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
+                    torch.save({'model': model.state_dict()},
                                 checkpoint_dir)
-
 
                 print(f"loss: {val:>7f}")
 
@@ -116,14 +128,12 @@ def train_geometry(model, encoder,
     print('\n')
     state = torch.load(checkpoint_dir)
     model.load_state_dict(state['model'])
-    encoder.load_state_dict(state['encoder'])
-
 
 # ======================================================================================
-# Stage 2: field (one step, hard blend)
+# Stage 2: field (one step, cut blend)
 # ======================================================================================
 
-def train_field(model, encoder,
+def train_field(model,
                 train_loader, val_loader,
                 x_cell, writer,
                 config = Path(__file__).parent.parent / 'configs' / 'train_config.yaml',
@@ -131,15 +141,12 @@ def train_field(model, encoder,
 
     os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
 
-    # enable training on FieldNet and the encoder (field.encoder: all trains the whole encoder)
+    # enable training on FieldNet only (LOCAL FIELDS: its FieldFeatureCNN included; no encoder)
     model.requires_grad_(False)
     model.FieldNet.requires_grad_(True)
 
-    # AUDIT 6: the arm comes from the model, not the train config
-    default = 'head' if geo_net(model) is not None else 'all'
-    enc_params = set_encoder_trainable(encoder, config['field'].get('encoder', default))
     # set up training components
-    params = list(model.FieldNet.parameters()) + enc_params
+    params = list(model.FieldNet.parameters())
     optimizer = torch.optim.Adam(params, lr=config['field']['lr'])
 
     step_tot = config['field']['epochs']*len(train_loader)
@@ -151,9 +158,10 @@ def train_field(model, encoder,
 
     #cvalidation/heckpointing purposes
     step, best = 0, torch.inf
-    noise = config['misc']['noise_std'] * encoder.w_std.view(-1)                 # [3], per variable
+    nan_guard = {'bad': 0, 'total': 0}
+    noise = config['misc']['noise_std'] * model.w_std.view(-1)                 # [3], per variable
 
-    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
+    torch.save({'model': model.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
     print("Beginning Stage 2 Training...")
     for epoch in range(config['field']['epochs']):
         print(f"-------------------------------\nEpoch {epoch+1}\n-------------------------------")
@@ -164,14 +172,12 @@ def train_field(model, encoder,
 
             # noisy W^n in, L1 at t_{n+1}
             W_in = batch['W_in'] + noise * torch.randn_like(batch['W_in'])
-            z_geo, z_field = encoder(W_in.transpose(1, 2))
-            loss, _ = cell_L1(model, W_in, batch['W_out'][:, 0], x_cell, z_geo, z_field)
+            loss, _ = cell_L1(model, W_in, batch['W_out'][:, 0], x_cell)
 
             optimizer.zero_grad(set_to_none=True)
-            (loss + config['misc']['lambdaZ'] * z_penalty(z_geo, z_field)).backward()
+            loss.backward()
 
-
-            nets = {'geo': geo_net(model), 'field': model.FieldNet, 'enc': encoder}
+            nets = {'geo': geo_net(model), 'field': model.FieldNet}
             for name, net in nets.items():
                 if net is None:              # one-region baseline has no geometry net
                     continue
@@ -179,29 +185,25 @@ def train_field(model, encoder,
                 if g and (step % 10 == 0):   # frozen nets have no grads, skip them
                     writer.add_scalar(f'stage2/grad_norm/{name}', torch.linalg.vector_norm(torch.stack([x.norm() for x in g])).item(), step)
 
-            torch.nn.utils.clip_grad_norm_(params, config['misc']['grad_clip'])
-            optimizer.step()
+            guarded_step(loss, params, optimizer, config['misc']['grad_clip'], nan_guard)   # NaN GUARD
             scheduler.step()
 
             writer.add_scalar('stage2/train_loss', loss.item(), step)
             writer.add_scalar('stage2/schedule/lr', scheduler.get_last_lr()[0], step)
-            writer.add_scalar('stage2/latent/z_geo norm', z_geo.norm(dim=-1).mean(), step)
-            writer.add_scalar('stage2/latent/z_field norm', z_field.norm(dim=-1).mean(), step)
 
             step += 1
-            tot_loss += loss.item()
-
+            tot_loss += loss.item() if torch.isfinite(loss) else 0.0
 
         print('TRAIN:')
         print(f"loss: {tot_loss / len(train_loader):>7f}")
         #validation evaluation
         if (epoch+1)%25 == 0:
 
-            val = val_L1(model, encoder, val_loader, x_cell)
+            val = val_L1(model, val_loader, x_cell)
             writer.add_scalar('stage2/val_loss', val, step)
             if val < best:
                 best = val
-                torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
+                torch.save({'model': model.state_dict()},
                             checkpoint_dir)
 
             print(f'VALIDATION [Epoch {epoch+1}]:')
@@ -212,13 +214,12 @@ def train_field(model, encoder,
     print('\n')
     state = torch.load(checkpoint_dir)
     model.load_state_dict(state['model'])
-    encoder.load_state_dict(state['encoder'])
 
 # ======================================================================================
 # Stage 3: fine-tuning (one step, + front loss at n and n+1)
 # ======================================================================================
 
-def finetune(model, encoder,
+def finetune(model,
              train_loader, val_loader,
              x_cell, writer,
              config = Path(__file__).parent.parent / 'configs' / 'train_config.yaml',
@@ -229,11 +230,9 @@ def finetune(model, encoder,
     # enable training on everything for fine-tuning
     model.requires_grad_(True)
 
-    enc_params = set_encoder_trainable(encoder, config['finetune'].get('encoder', 'none'))
-
-    # set up training components
+    # set up training components (LOCAL FIELDS: each module brings its own CNN, no encoder)
     geo_params = list(geo_net(model).parameters()) if geo_net(model) is not None else []
-    field_encode_params = list(model.FieldNet.parameters()) + enc_params
+    field_encode_params = list(model.FieldNet.parameters())
     optimizer = torch.optim.Adam([{'params': geo_params, 'lr': config['finetune']['geo_lr']},
                                   {'params': field_encode_params, 'lr': config['finetune']['field_lr']}])
 
@@ -244,9 +243,10 @@ def finetune(model, encoder,
 
     #cvalidation/heckpointing purposes
     step, best = 0, torch.inf
-    noise = config['misc']['noise_std'] * encoder.w_std.view(-1)
+    nan_guard = {'bad': 0, 'total': 0}
+    noise = config['misc']['noise_std'] * model.w_std.view(-1)
 
-    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
+    torch.save({'model': model.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
     print("Beginning Stage 3 Training...")
     for epoch in range(config['finetune']['epochs']):
         print(f"-------------------------------\nEpoch {epoch+1}\n-------------------------------")
@@ -257,19 +257,17 @@ def finetune(model, encoder,
 
             # noisy W^n in, L1 at t_{n+1}, plus CE at n and on the advected scores at n+1
             W_in = batch['W_in'] + noise * torch.randn_like(batch['W_in'])
-            z_geo, z_field = encoder(W_in.transpose(1, 2))
-            loss, out = cell_L1(model, W_in, batch['W_out'][:, 0], x_cell, z_geo, z_field)     # AUDIT fix: hard blend
+            loss, out = cell_L1(model, W_in, batch['W_out'][:, 0], x_cell)     # cut blend (forward)
 
             if out['phi_hat'] is not None:       # one-region arm has no geometry
-                ce = front_loss(out, batch['classes'][:, :2], batch['flags'][:, :2])     # AUDIT fix: + boundary loss
+                ce = front_loss(out, batch['fronts'][:, :2], x_cell)     # DISTANCE TARGET at n and n+1
                 loss = loss + config['finetune']['lambda_ce'] * ce
                 writer.add_scalar('stage3/loss/front', ce, step)
 
             optimizer.zero_grad(set_to_none=True)
-            (loss + config['misc']['lambdaZ'] * z_penalty(z_geo, z_field)).backward()
+            loss.backward()
 
-
-            nets = {'geo': geo_net(model), 'field': model.FieldNet, 'enc': encoder}
+            nets = {'geo': geo_net(model), 'field': model.FieldNet}
             for name, net in nets.items():
                 if net is None:
                     continue
@@ -277,47 +275,42 @@ def finetune(model, encoder,
                 if g and (step % 10 == 0):   # frozen nets have no grads, skip them
                     writer.add_scalar(f'stage3/grad_norm/{name}', torch.linalg.vector_norm(torch.stack([x.norm() for x in g])).item(), step)
 
-            torch.nn.utils.clip_grad_norm_(geo_params + field_encode_params, config['misc']['grad_clip'])
-            optimizer.step()
+            guarded_step(loss, geo_params + field_encode_params, optimizer, config['misc']['grad_clip'], nan_guard)   # NaN GUARD
             scheduler.step()
 
             writer.add_scalar('stage3/train_loss', loss.item(), step)
             writer.add_scalar('stage3/schedule/lr_geo', scheduler.get_last_lr()[0], step)
             writer.add_scalar('stage3/schedule/lr_field_enc', scheduler.get_last_lr()[-1], step)
-            writer.add_scalar('stage3/latent/z_geo norm', z_geo.norm(dim=-1).mean(), step)
-            writer.add_scalar('stage3/latent/z_field norm', z_field.norm(dim=-1).mean(), step)
 
             step += 1
-            tot_loss += loss.item()
+            tot_loss += loss.item() if torch.isfinite(loss) else 0.0
 
         print('TRAIN:')
         print(f"loss: {tot_loss / len(train_loader):>7f}")
         #validation evaluation
         if (epoch+1)%25 == 0:
 
-            val = val_L1(model, encoder, val_loader, x_cell)
+            val = val_L1(model, val_loader, x_cell)
             writer.add_scalar('stage3/val_loss', val, step)
             if val < best:
                 best = val
-                torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
+                torch.save({'model': model.state_dict()},
                         checkpoint_dir)
 
             print(f'VALIDATION [Epoch {epoch+1}]:')
             print(f"loss: {val:>7f}")
-
 
     optimizer.zero_grad(set_to_none=True)
     print("Stage 3 Training Complete!")
     print('\n')
     state = torch.load(checkpoint_dir)
     model.load_state_dict(state['model'])
-    encoder.load_state_dict(state['encoder'])
 
 # ======================================================================================
 # Stage 4: rollout
 # ======================================================================================
 
-def train_rollout(model, encoder,
+def train_rollout(model,
                   train_loaders, val_loader,
                   x_cell, writer,
                   config = Path(__file__).parent.parent / 'configs' / 'train_config.yaml',
@@ -327,20 +320,19 @@ def train_rollout(model, encoder,
     os.makedirs(os.path.dirname(checkpoint_dir), exist_ok=True)
     cfg = config['rollout']
 
-    # everything trains, at one lower lr. AUDIT fix: the level-set arm keeps its encoder frozen (z_geo places
-    # every front, so training it on L1 moves them); the one-region arm trains it, as in stage 2
+    # everything trains, at one lower lr (LOCAL FIELDS: no encoder)
     model.requires_grad_(True)
-    enc_params = set_encoder_trainable(encoder, cfg.get('encoder', 'none' if geo_net(model) is not None else 'all'))
-    params = list(model.parameters()) + enc_params
+    params = list(model.parameters())
     optimizer = torch.optim.Adam(params, lr=cfg['lr'])
 
     step_tot = cfg['epochs_per_R'] * sum(len(loader) for loader in train_loaders)
     scheduler = CosineAnnealingLR(optimizer, step_tot, eta_min = cfg['lr_min'])
 
     step = 0
-    best = val_L1(model, encoder, val_loader, x_cell)        # AUDIT fix: stage 4 keeps the incoming model unless it beats it
+    nan_guard = {'bad': 0, 'total': 0}
+    best = val_L1(model, val_loader, x_cell)        # AUDIT fix: stage 4 keeps the incoming model unless it beats it
 
-    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
+    torch.save({'model': model.state_dict()}, checkpoint_dir)   # AUDIT 9: a checkpoint exists even if every val is NaN
     print("Beginning Stage 4 Training...")
     for R, train_loader in zip(cfg['R'], train_loaders):
         for epoch in range(cfg['epochs_per_R']):
@@ -350,14 +342,14 @@ def train_rollout(model, encoder,
             for batch in train_loader:
                 batch = {key: val.to(x_cell.device) for key, val in batch.items()}
 
-                loss, pen = rollout_L1(model, encoder, batch, x_cell, cfg.get('detach', False),
-                                      cfg['lambda_ce'])                  # AUDIT fix: CE keeps the fronts on the data
+                loss = rollout_L1(model, batch, x_cell, cfg.get('detach', False),
+                                      cfg['lambda_ce'])                  # distance-target front loss keeps the fronts on the data
 
                 optimizer.zero_grad(set_to_none=True)
-                (loss + config['misc']['lambdaZ'] * pen).backward()
+                loss.backward()
 
                 # AUDIT 9: grad-norm logging, same block as stage 3
-                nets = {'geo': geo_net(model), 'field': model.FieldNet, 'enc': encoder}
+                nets = {'geo': geo_net(model), 'field': model.FieldNet}
                 for name, net in nets.items():
                     if net is None:
                         continue
@@ -365,8 +357,7 @@ def train_rollout(model, encoder,
                     if g and (step % 10 == 0):
                         writer.add_scalar(f'stage4/grad_norm/{name}', torch.linalg.vector_norm(torch.stack([x.norm() for x in g])).item(), step)
 
-                torch.nn.utils.clip_grad_norm_(params, config['misc']['grad_clip'])
-                optimizer.step()
+                guarded_step(loss, params, optimizer, config['misc']['grad_clip'], nan_guard)   # NaN GUARD
                 scheduler.step()
 
                 writer.add_scalar('stage4/train_loss', loss.item(), step)
@@ -374,18 +365,18 @@ def train_rollout(model, encoder,
                 writer.add_scalar('stage4/schedule/R', R, step)
 
                 step += 1
-                tot_loss += loss.item()
+                tot_loss += loss.item() if torch.isfinite(loss) else 0.0
 
             print('TRAIN:')
             print(f"loss: {tot_loss / len(train_loader):>7f}")
             #validation evaluation: full rollout t0 -> T_train, comparable across R
             if (epoch+1)%25 == 0 or epoch+1 == cfg['epochs_per_R']:
 
-                val = val_L1(model, encoder, val_loader, x_cell)
+                val = val_L1(model, val_loader, x_cell)
                 writer.add_scalar('stage4/val_loss', val, step)
                 if val < best:
                     best = val
-                    torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
+                    torch.save({'model': model.state_dict()},
                                checkpoint_dir)
 
                 print(f'VALIDATION [R = {R}, Epoch {epoch+1}]:')
@@ -396,7 +387,6 @@ def train_rollout(model, encoder,
     print('\n')
     state = torch.load(checkpoint_dir)
     model.load_state_dict(state['model'])
-    encoder.load_state_dict(state['encoder'])
 
 # ======================================================================================
 # Master
@@ -438,45 +428,32 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
         model = NeuralChart1DST(config = model_cfg,
                                 N_input = model_cfg['architecture']['coordinate_input']
                                 ).to(device)
-        # CNN encoder on W^n; argument names follow the model thread's FieldEncoder
-        enc_cfg = model_cfg['encoder']
-        encoder = FieldEncoder(N_channels = 3,
-                               N_grid = enc_cfg['N_grid'],
-                               conv_channels = enc_cfg['conv_channels'],
-                               kernel = enc_cfg['kernel'],
-                               hidden_layers = enc_cfg['encodernet']['hidden_layers'],
-                               z_geo = model_cfg['architecture']['latent']['z_geo'],
-                               z_field = model_cfg['architecture']['latent']['z_field']
-                               ).to(device)
-        # per-variable stats over the training split; they are buffers, so every checkpoint keeps them
-        encoder.w_mean.copy_(train_ds.W.mean((0, 1, 2)).view_as(encoder.w_mean))
-        encoder.w_std.copy_(train_ds.W.std((0, 1, 2)).view_as(encoder.w_std))
-        # LOCAL GEOMETRY: the geometry standardizes its own input with the same stats
-        if not baseline:
-            model.LevelSetsNet.w_mean.copy_(encoder.w_mean)
-            model.LevelSetsNet.w_std.copy_(encoder.w_std)
+        # LOCAL FIELDS: no encoder. Per-variable stats over the training split, used by both CNNs; buffers, so
+        # every checkpoint keeps them
+        model.w_mean.copy_(train_ds.W.mean((0, 1, 2)).view_as(model.w_mean))
+        model.w_std.copy_(train_ds.W.std((0, 1, 2)).view_as(model.w_std))
 
         writer = SummaryWriter(os.path.join(log_dir, model_cfg['name']))
 
         if not baseline:
-            train_geometry(model = model, encoder = encoder,
+            train_geometry(model = model,
                         train_loader = train_loader, val_loader = val_loader,
                         x_cell = x_cell, writer = writer,
                         config = train_cfg,
                         checkpoint_dir = os.path.join(checkpth, 'stage1.pt'))
-        train_field(model = model, encoder = encoder,
+        train_field(model = model,
                        train_loader = train_loader, val_loader = val_loader,
                        x_cell = x_cell, writer = writer,
                        config = train_cfg,
                        checkpoint_dir = os.path.join(checkpth, 'stage2.pt'))
-        # LOCAL GEOMETRY: no geometry refit. The geometry does not read the encoder, so stage 2 moving it changes nothing
-        finetune(model = model, encoder = encoder,
+        # no geometry refit: nothing is shared between the geometry and the fields, so stage 2 cannot move the geometry
+        finetune(model = model,
                        train_loader = train_loader, val_loader = val_loader,
                        x_cell = x_cell, writer = writer,
                        config = train_cfg,
                        checkpoint_dir = os.path.join(checkpth, 'stage3.pt'))
         # stage 4 (rollout) is cut
-        # train_rollout(model = model, encoder = encoder,
+        # train_rollout(model = model,
         #                train_loaders = rollout_loaders, val_loader = val_rollout,
         #                x_cell = x_cell, writer = writer,
         #                config = train_cfg,
@@ -484,9 +461,9 @@ def train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'model_c
 
         writer.close()
 
-        torch.save({'model': model.state_dict(), 'encoder': encoder.state_dict()},
+        torch.save({'model': model.state_dict()},
                    f=os.path.join(savepth, f'trained_model.pt'))
-        return model, encoder
+        return model
 
 if __name__ == '__main__':
     train_NC1DST(model_cfg = Path(__file__).parent.parent / 'configs' / 'models_cfg' / 'model_one' / 'model_config.yaml',

@@ -5,7 +5,6 @@ architecture:
   ablation:
     geometry: levelset  # levelset | none
     jump_mode: RH       # RH | free
-    fourier: "on"       # on | off
 
 data:
   t0: 0.02              # rollout start, after the waves separate
@@ -22,24 +21,22 @@ geometry:
   lr_min: 1.0e-5
   warmup_steps: 2000
                         # AUDIT 5: eps0 and eps_min removed (no eps in the losses)
-  lambda_ce: 1.0        # ⚑ class CE weight at t_n
-  encoder: none         # LOCAL GEOMETRY: stage 1 trains LevelSetsNet (conv + INR) only
+  lambda_ce: 1.0        # unused: stage 1 is now the distance-target Huber loss alone (kappa 4, clip 3, in helper.py)
 
 field:
   epochs: 750
-  lr: 5.0e-3
+  lr: 1.0e-3            # was 5e-3: stage 2 diverged at the warmup peak (train L1 0.005 -> 0.065, never recovered)
   lr_min: 1.0e-5
   warmup_steps: 2000
-  encoder: all          # AUDIT fix: the whole encoder learns the plateaus (head only left a per-step bias)
 
-# LOCAL GEOMETRY: geometry_refit removed (nothing in the geometry reads the encoder any more)
+# geometry_refit removed: nothing is shared between the geometry and the fields
 
 finetune:
   epochs: 300
-  geo_lr: 1.0e-4
+  geo_lr: 3.0e-5         # was 1e-4: the old stage 3 geometry grad grew 0.2 -> 2+ and the front loss rose; slower geometry
   field_lr: 1.0e-4
   lr_min: 1.0e-6
-  lambda_ce: 0.1        # ⚑ weight on CE at n + CE at n+1
+  lambda_ce: 1.0        # was 0.1 (tuned for CE). ⚑ weight on the distance-target front loss at n + n+1 (was CE + boundary; Huber values are much smaller, watch stage3/loss/front)
 
 rollout:                # stage 4
   R: [2, 4]             # AUDIT: R = 8 runs out of memory
@@ -47,10 +44,9 @@ rollout:                # stage 4
   lr: 1.0e-4            # AUDIT ⚑ was 3e-4, 3x stage 3's lr with no warmup on a converged model
   lr_min: 1.0e-6
   detach: false         # true cuts the graph between steps: no gradient through the model's own input
-  lambda_ce: 0.1        # AUDIT fix ⚑ CE at n and n+1 per step, as in stage 3; without it the fronts drift
+  lambda_ce: 1.0        # was 0.1. ⚑ distance-target front loss at n and n+1 per step, as in stage 3; without it the fronts drift
 
 misc:
-  lambdaZ: 0.0           # was 1e-5; with the CNN encoder its only effect was shrinking a latent no loss reaches (z_geo in stage 2)
   grad_clip: 1.0
   noise_std: 0.01       # ⚑ input noise in stages 2-3, as a fraction of each variable's std
 

@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from model.features import FeatureCNN
+
 # ======================================================================================
 # Geometry Net
 # ======================================================================================
@@ -8,10 +10,10 @@ import torch.nn as nn
 class LevelSetsNet(nn.Module):
     '''
     Local level sets: raw zone scores phi(u) from the input field near u.         # LOCAL GEOMETRY
-        - features: W_grid [B, C, N] -> standardize -> Conv1d stack (stride 1, replicate padding,
-          no coordinate channel) -> feat_grid [B, N_feat, N]. Cell i sees i +- n_layers * (kernel // 2) cells.
+        - features: FeatureCNN on the standardized W(t_n) -> feat_grid [B, N_feat, N] (+-8 cells with 4 layers
+          of kernel 5). The model standardizes (NeuralChart1DST.w_mean / w_std, shared with FieldNet's CNN).
         - net: INR MLP on f(u) [P, N_feat], the features read at u (sample_grid in neural_chart.py) -> phi [P, K].
-    No x~, no Fourier features, no z_geo: the same weights at every x, so phi depends only on W near u.
+    No x~, no Fourier features, no latent: the same weights at every x, so phi depends only on W near u.
     '''
 
     def __init__(self, N_channels, N_out,
@@ -21,19 +23,7 @@ class LevelSetsNet(nn.Module):
 
         super().__init__()
 
-        # set once from the training data (as FieldEncoder's); saved with the checkpoint
-        self.register_buffer("w_mean", torch.zeros(N_channels, 1))
-        self.register_buffer("w_std", torch.ones(N_channels, 1))
-
-        # conv stack: len(conv_channels) + 1 layers, the last one linear into the feature channels
-        dims = [N_channels] + conv_channels + [N_feat]
-        layers = []
-        for i in range(len(dims) - 1):
-            layers.append(nn.Conv1d(dims[i], dims[i+1], kernel, stride = 1,
-                                    padding = kernel // 2, padding_mode = 'replicate'))
-            if i < len(dims) - 2:
-                layers.append(act())
-        self.features = nn.Sequential(*layers)
+        self.features = FeatureCNN(N_channels, conv_channels, N_feat, kernel, act)
 
         # INR head on the local features
         dims = [N_feat] + hidden_layers + [N_out]
@@ -44,20 +34,19 @@ class LevelSetsNet(nn.Module):
                 layers.append(act())
         self.net = nn.Sequential(*layers)
 
-        # ⚑ He init, zero bias, as in FieldEncoder (default init shrinks input differences layer by layer)
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv1d)):
+        # ⚑ He init, zero bias, as in the CNN
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity = 'relu')
                 nn.init.zeros_(m.bias)
 
-    def feat_grid(self, W_grid):
-        """W_grid [B, C, N] primitives -> feat_grid [B, N_feat, N]. Once per step."""
-        return self.features((W_grid.to(torch.float32) - self.w_mean) / self.w_std)
+    def feat_grid(self, W_std):
+        """Standardized W_grid [B, C, N] -> feat_grid [B, N_feat, N]. Once per step."""
+        return self.features(W_std)
 
     def forward(self, f):
         """f [P, N_feat] features read at the query points -> phi [P, K]."""
         return self.net(f)
-
 
 # ======================================================================================
 # Front frame (physics-agnostic: depends only on the level sets)
@@ -75,7 +64,6 @@ def newton_step(phi_fn, u, d, j, create_graph: bool = False):                   
     n = -grad / norm[:, None]
     foot = u.detach() + (psi / norm)[:, None] * n
     return (foot, n, norm) if create_graph else (foot.detach(), n.detach(), norm.detach())
-
 
 def front_frame(phi_fn, x, d, j, create_graph: bool = False, steps: int = 8) -> dict:   # AUDIT 3: no delta. AUDIT fix: 8 steps
     """Frame of each point's nearest front: the front between its own zone d and zone j.
@@ -108,7 +96,6 @@ def front_frame(phi_fn, x, d, j, create_graph: bool = False, steps: int = 8) -> 
         frame = {k: v.detach() for k, v in frame.items()}
     return frame
 
-
 def front_distances(phi_fn, x, z, d, offset: float, steps: int = 8) -> torch.Tensor:   # AUDIT 1 fix
     """Distance from each point to the front between its own zone d and every other zone k, from
     front_frame. A front counts only if it is there: zone d wins at x_foot - offset*n and zone k at
@@ -126,7 +113,6 @@ def front_distances(phi_fn, x, z, d, offset: float, steps: int = 8) -> torch.Ten
         dist[:, k] = torch.where(there, fr['dist'], dist[:, k])
     return dist
 
-
 def advect(frame, d, j, s, dt_x: float, reach: float):
     """Move each band point's front one time step: by s * dt_x along n (x~), s [P] in field units along n.
 
@@ -142,7 +128,6 @@ def advect(frame, d, j, s, dt_x: float, reach: float):
     frame = {'dist': sign * dist, 'n': sign[:, None] * frame['n'], 'norm': frame['norm'],
              'x_foot': frame['x_foot'] + shift[:, None] * frame['n'], 'shift': shift}
     return frame, torch.where(flipped, j, d), torch.where(flipped, d, j), sign * s, flipped
-
 
 def advect_scores(phi, idx, d, j, dpsi):
     """phi at t_n+1: at band points idx (time-n zones d, j), psi = phi_d - phi_j grows by dpsi,
