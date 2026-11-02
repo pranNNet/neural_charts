@@ -231,6 +231,7 @@ slurm
 
 logs
 diagnostics
+diagnostics_nah
 
 diag_animate.py
 diag_errors.py
