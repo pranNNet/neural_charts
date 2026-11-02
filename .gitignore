@@ -229,6 +229,8 @@ data
 
 logs
 diagnostics
+diagnostics_nah
+slurm
 
 diag_animate.py
 diag_errors.py
